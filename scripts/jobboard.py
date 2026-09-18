@@ -436,7 +436,7 @@ def cmd_sync_resumes(_args) -> int:
     print(
         f'{result["ready"]} ready resumes in {result["directory"]} '
         f'({result["copied"]} copied, {result["removed"]} removed, '
-        f'{result["missing"]} missing).'
+        f'{result["missing"]} missing, {result["errors"]} permission/I/O errors).'
     )
     return 0
 

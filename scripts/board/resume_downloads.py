@@ -68,28 +68,42 @@ def sync_ready_resumes(conn, download_dir: Path | None = None) -> dict[str, int 
         desired[filename] = relative
 
     copied = 0
+    errors = 0
     for filename, source_value in desired.items():
         source = _source_path(source_value)
         destination = target / filename
-        if not destination.exists() or not filecmp.cmp(source, destination, shallow=False):
-            shutil.copy2(source, destination)
-            copied += 1
+        try:
+            if not destination.exists() or not filecmp.cmp(source, destination, shallow=False):
+                shutil.copy2(source, destination)
+                copied += 1
+        except OSError:
+            # A background launchd process may lack macOS privacy permission for
+            # Downloads. Tracker/status writes must still succeed; a later manual
+            # `sync-resumes` run can reconcile upload copies from the terminal.
+            errors += 1
 
     removed = 0
     for filename in set(previous) - set(desired):
         path = target / filename
-        if path.is_file():
-            path.unlink()
-            removed += 1
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += 1
+        except OSError:
+            errors += 1
 
-    manifest_path.write_text(
-        json.dumps({"version": 1, "files": desired}, indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
+    try:
+        manifest_path.write_text(
+            json.dumps({"version": 1, "files": desired}, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    except OSError:
+        errors += 1
     return {
         "ready": len(desired),
         "copied": copied,
         "removed": removed,
         "missing": missing,
+        "errors": errors,
         "directory": str(target),
     }
