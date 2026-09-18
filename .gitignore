@@ -1,0 +1,36 @@
+__pycache__/
+*.pyc
+.DS_Store
+.env
+.venv/
+.resume-venv/
+tmp/
+
+# Private user profile and job-search state. Copy the tracked examples locally.
+config/profile.yml
+config/board.json
+cv.md
+profile/master.md
+profile/resume-variants.md
+data/applications.md
+data/pipeline.md
+data/reminders.md
+data/*.db
+data/*.db-journal
+
+# Job descriptions, evaluations, and generated application materials.
+jds/*
+!jds/.gitkeep
+reports/*
+!reports/.gitkeep
+output/*
+!output/.gitkeep
+!output/open-resumes/
+!output/open-resumes/.gitkeep
+!output/completed-resumes/
+!output/completed-resumes/.gitkeep
+
+# Locally rendered board and document outputs.
+output/board.html
+*.pdf
+*.docx

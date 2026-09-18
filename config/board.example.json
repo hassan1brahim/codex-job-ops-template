@@ -1,0 +1,16 @@
+{
+  "home": {
+    "latitude": 39.8283,
+    "longitude": -98.5795,
+    "label": "Home"
+  },
+  "primary_state": "",
+  "primary_label": "Primary area",
+  "secondary_state": "",
+  "secondary_label": "Secondary area",
+  "linkedin_queries": [
+    ["software engineer intern", "United States"],
+    ["data science intern", "United States"],
+    ["machine learning intern", "United States"]
+  ]
+}

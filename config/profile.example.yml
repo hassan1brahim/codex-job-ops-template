@@ -1,0 +1,50 @@
+identity:
+  name: "Your Name"
+  email: "you@example.com"
+  phone: ""
+  location: "City, State, Country"
+  timezone: "America/New_York"
+  linkedin: ""
+  github: ""
+  portfolio: ""
+
+education:
+  expected_graduation: ""
+  current_degree: ""
+
+targets:
+  roles:
+    - "Software Engineering Intern"
+  industries: []
+  locations:
+    - "Remote"
+  company_types: []
+  seniority: ""
+
+constraints:
+  work_authorization: "unknown"
+  visa_sponsorship_needed: "unknown"
+  earliest_start: ""
+  latest_end: ""
+  compensation_min: ""
+  notice_period: ""
+  onsite_policy: ""
+  relocation: ""
+
+preferences:
+  avoid: []
+  prioritize: []
+
+tracking:
+  sources:
+    - "LinkedIn"
+    - "company careers page"
+  statuses:
+    - "saved"
+    - "evaluated"
+    - "applied"
+    - "screen"
+    - "interview"
+    - "offer"
+    - "rejected"
+    - "ghosted"
