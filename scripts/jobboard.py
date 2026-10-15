@@ -15,12 +15,15 @@ the good ones to the existing resume pipeline.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import http.server
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,7 +32,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from board import store  # noqa: E402
-from board.filters import BoardConfig  # noqa: E402
+from board.filters import BoardConfig, keep_job  # noqa: E402
 from board.geo import TIER_LABELS  # noqa: E402
 from board.resume_downloads import sync_ready_resumes  # noqa: E402
 from board.sources import DEFAULT_SOURCES, REGISTRY  # noqa: E402
@@ -66,6 +69,8 @@ def _cfg(args) -> BoardConfig:
         cfg.max_tier = args.max_tier
     if getattr(args, "linkedin_pages", None):
         cfg.linkedin_pages = args.linkedin_pages
+    if getattr(args, "linkedin_mode", None):
+        cfg.linkedin_mode = args.linkedin_mode
     if getattr(args, "terms", None):
         cfg.terms = set(args.terms)
     return cfg
@@ -115,10 +120,13 @@ def cmd_refresh(args) -> int:
 
         new, upd = store.upsert(conn, result.jobs)
         removed = 0
-        if name == "ats" and result.ok:
+        if name in {"ats", "career_pages"} and result.ok:
             removed = store.mark_inactive_missing_ats(conn, result.jobs, result.successful_boards)
+        elif name in store.SIGHTING_ONLY_SOURCES:
+            removed = store.expire_unseen(conn, name, store.SEARCH_SAMPLE_EXPIRY_DAYS)
         elif result.ok and "failed" not in (result.note or ""):
-            removed = store.mark_inactive_missing(conn, name, {job.key for job in result.jobs})
+            removed = store.mark_inactive_missing(conn, name, {job.key for job in result.jobs},
+                                                  since=int(started))
         health, newest = store.classify_run(result.jobs, args.stale_days)
         note = result.note
         if health != "ok":
@@ -136,7 +144,10 @@ def cmd_refresh(args) -> int:
         if health != "ok":
             print(f"   ! DEGRADED: {_HEALTH_NOTE[health](newest)}")
 
-    print(f"\n{total_new} new, {total_upd} updated.")
+    # Judge only what the role is; a narrower --tier or term window must never retire rows.
+    role_cfg = dataclasses.replace(cfg, max_tier=99, terms=set())
+    retired = store.retire_filtered(conn, lambda job: keep_job(job, role_cfg))
+    print(f"\n{total_new} new, {total_upd} updated, {retired} retired by the current filter.")
     if degraded:
         print(f"! degraded sources: {', '.join(degraded)} "
               f"(answered, but carried nothing posted within {args.stale_days}d)")
@@ -435,7 +446,7 @@ def cmd_sync_resumes(_args) -> int:
     result = sync_ready_resumes(store.connect())
     print(
         f'{result["ready"]} ready resumes in {result["directory"]} '
-        f'({result["copied"]} copied, {result["removed"]} removed, '
+        f'({result["copied"]} added, {result["suppressed"]} user-deleted kept deleted, '
         f'{result["missing"]} missing, {result["errors"]} permission/I/O errors).'
     )
     return 0
@@ -461,6 +472,7 @@ def cmd_artifacts(args) -> int:
     if not store.save_artifacts(
         conn, args.key, fit_score=fit_score, fit_report_path=args.fit_report,
         resume_tex_path=args.resume_tex, resume_pdf_path=args.resume_pdf,
+        decision_reason=args.decision_reason,
     ):
         print(f"No job with key {args.key}", file=sys.stderr)
         return 1
@@ -532,10 +544,36 @@ def cmd_seen(args) -> int:
 
 def cmd_serve(args) -> int:
     """Serve the board locally with the one write endpoint the UI needs."""
-    from board.render import render
+    from board.render import DESC_LIMIT, render
 
     render(store.connect(), ROOT / "output" / "board.html", max_tier=args.tier)
     os.chdir(ROOT)
+
+    render_timer = None
+    render_timer_lock = threading.Lock()
+    render_run_lock = threading.Lock()
+
+    def render_latest() -> None:
+        nonlocal render_timer
+        try:
+            with render_run_lock:
+                render(store.connect(), ROOT / "output" / "board.html", max_tier=args.tier)
+        except Exception as exc:  # keep the write API alive if regeneration fails
+            print(f"Background board render failed: {exc}", file=sys.stderr)
+        finally:
+            with render_timer_lock:
+                if render_timer is threading.current_thread():
+                    render_timer = None
+
+    def schedule_render() -> None:
+        """Coalesce bursts of writes without holding up the browser response."""
+        nonlocal render_timer
+        with render_timer_lock:
+            if render_timer is not None:
+                render_timer.cancel()
+            render_timer = threading.Timer(0.15, render_latest)
+            render_timer.daemon = True
+            render_timer.start()
 
     class Handler(http.server.SimpleHTTPRequestHandler):
         def do_GET(self):  # noqa: N802 - stdlib handler API
@@ -543,6 +581,21 @@ def cmd_serve(args) -> int:
                 self.send_response(302)
                 self.send_header("Location", "/output/board.html")
                 self.end_headers()
+                return
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/api/description":
+                key = urllib.parse.parse_qs(parsed.query).get("key", [""])[0]
+                row = store.connect().execute(
+                    "SELECT description FROM jobs WHERE key=?", (key,)
+                ).fetchone()
+                if not row:
+                    self.send_error(404, "unknown job")
+                    return
+                description = row["description"] or ""
+                self._reply({
+                    "description": description[:DESC_LIMIT],
+                    "truncated": len(description) > DESC_LIMIT,
+                })
                 return
             super().do_GET()
 
@@ -594,11 +647,11 @@ def cmd_serve(args) -> int:
                         notes=payload.get("notes", ""),
                     )
 
-                # Marking a row seen happens on every row open; re-rendering the
-                # whole page for that would make opening a job cost a full rebuild.
-                if self.path != "/api/triage" or "saved" in payload:
-                    render(store.connect(), ROOT / "output" / "board.html", max_tier=args.tier)
                 self._reply(result)
+                # Acknowledge the click before regenerating the multi-megabyte
+                # static artifact. Bursts are collapsed into one background render.
+                if self.path != "/api/triage" or "saved" in payload:
+                    schedule_render()
             except (ValueError, KeyError, json.JSONDecodeError) as exc:
                 self.send_error(400, str(exc))
 
@@ -628,6 +681,10 @@ def cmd_status(args) -> int:
         print(f'  {TIER_LABELS[row["tier"]]:16} {row["n"]}')
     print("\nSOURCES")
     for run in store.latest_runs(conn):
+        # Retired sources remain in durable history but are no longer part of
+        # current coverage and must not linger on the status board forever.
+        if run["source"] not in REGISTRY:
+            continue
         age = (time.time() - run["ran_at"]) / 3600
         state = "BLOCKED" if not run["ok"] else _STATE_LABEL.get(run["status"], run["status"].upper())
         newest = run["newest_posting"]
@@ -655,9 +712,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     ref = sub.add_parser("refresh", help="Pull all sources into the board.")
     ref.add_argument("--sources", nargs="*", help=f"Subset of {list(REGISTRY)}")
-    ref.add_argument("--all", action="store_true", help="Include known-blocked sources.")
+    ref.add_argument("--all", action="store_true", help="Include optional blocked sources.")
     ref.add_argument("--max-tier", type=int, default=4)
     ref.add_argument("--linkedin-pages", type=int)
+    ref.add_argument("--linkedin-mode", choices=["fast", "deep"],
+                     help="fast: broad intern searches, last 24h (hourly). deep: + role searches, last week.")
     ref.add_argument("--terms", nargs="*")
     ref.add_argument("--stale-days", type=int, default=store.STALE_SOURCE_DAYS,
                      help="Flag a source as degraded when its newest posting is older than this.")
@@ -763,6 +822,7 @@ def build_parser() -> argparse.ArgumentParser:
     art.add_argument("--fit-report")
     art.add_argument("--resume-tex")
     art.add_argument("--resume-pdf")
+    art.add_argument("--decision-reason", help="Short apply/skip rationale shown on the board.")
     art.set_defaults(func=cmd_artifacts)
 
     srv = sub.add_parser("serve", help="Open a local board with direct status controls.")

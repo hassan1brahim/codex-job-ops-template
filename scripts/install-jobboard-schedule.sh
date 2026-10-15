@@ -22,7 +22,7 @@ for job_label in "$LABEL" "$HOURLY_LABEL" "$SERVER_LABEL" "$ARCHIVE_LABEL"; do
     launchctl bootstrap "gui/$(id -u)" "$dest"
 done
 
-echo "Installed hourly discovery (including capped LinkedIn) plus deep runs at 08:30 and 17:30."
+echo "Installed hourly discovery (including all career pages) plus deep runs at 08:30 and 17:30."
 echo "  status:    launchctl print gui/$(id -u)/$LABEL | head -20"
 echo "  run now:   launchctl kickstart -k gui/$(id -u)/$LABEL"
 echo "  logs:      tail -f /tmp/codex-job-ops-jobboard.log"

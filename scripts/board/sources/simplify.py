@@ -12,12 +12,12 @@ import urllib.request
 
 from ..filters import keep_job
 from ..geo import best_place, sort_key
-from ..store import Job
+from ..store import Job, link_id
 
-# Repos follow a season naming convention; several cycles stay live at once.
+# Summer2026-Internships was renamed to Summer2027-Internships and GitHub redirects the old raw
+# URL, so listing both downloaded the identical payload twice (same SHA-256) and doubled `fetched`.
 REPOS = [
     "SimplifyJobs/Summer2027-Internships",
-    "SimplifyJobs/Summer2026-Internships",
 ]
 PATH = ".github/scripts/listings.json"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
@@ -68,7 +68,7 @@ def fetch(cfg) -> "object":
         for raw in rows:
             job = _to_job(raw, "simplify")
             if job and keep_job(job, cfg):
-                seen.setdefault(job.key, job)
+                seen.setdefault(link_id(job.url), job)
 
     if not seen and errors:
         return SourceResult("simplify", False, [], fetched, "; ".join(errors))

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from ..filters import keep_job
 from ..geo import best_place
-from ..store import Job
+from ..store import Job, link_id
 from .simplify import _get_json
 
 # Summer2026-Internships was RENAMED to Summer2027-Internships, and GitHub
@@ -56,7 +56,7 @@ def fetch(cfg) -> "object":
                 place_label=place.display(),
             )
             if job.company and job.title and job.url and keep_job(job, cfg):
-                seen.setdefault(job.key, job)
+                seen.setdefault(link_id(job.url), job)
 
     if not seen and errors:
         return SourceResult("vansh", False, [], fetched, "; ".join(errors))

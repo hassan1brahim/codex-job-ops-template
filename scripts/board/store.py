@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     ,score_reasons       TEXT
     ,fit_score           INTEGER
     ,fit_report_path     TEXT
+    ,decision_reason     TEXT
     ,resume_tex_path     TEXT
     ,resume_pdf_path     TEXT
     ,resume_generated_at INTEGER
@@ -187,10 +188,44 @@ class Job:
     ats_vendor: str | None = None
     ats_board: str | None = None
     ats_requisition_id: str | None = None
+    uid: str | None = None  # set when one feed lists the same title at several links
 
     @property
     def key(self) -> str:
-        return dedupe_key(self.company, self.title, self.url)
+        base = dedupe_key(self.company, self.title, self.url)
+        if not self.uid:
+            return base
+        return hashlib.sha1(f"{base}|{self.uid}".encode("utf-8")).hexdigest()[:16]
+
+
+_TRACKING = re.compile(r"^(utm_\w+|src|source|ref|gh_src|lever-source.*|trk\w*)$", re.I)
+
+
+def link_id(url: str) -> str:
+    """A posting's link minus tracking params; ids like ?job_id= stay."""
+    base, _, query = (url or "").split("#")[0].partition("?")
+    kept = sorted(p for p in query.split("&") if p and not _TRACKING.match(p.split("=")[0]))
+    return (base.rstrip("/") + ("?" + "&".join(kept) if kept else "")).lower()
+
+
+def split_same_title(conn: sqlite3.Connection, jobs: list[Job]) -> None:
+    """Give each link its own key when one feed has several postings with one title.
+
+    The link already stored under the shared key keeps it, so existing rows stay put.
+    """
+    groups: dict[str, list[Job]] = {}
+    for job in jobs:
+        if job.source not in SIGHTING_ONLY_SOURCES:
+            groups.setdefault(job.key, []).append(job)
+    for key, same in groups.items():
+        links = sorted({link_id(j.url) for j in same})
+        if len(links) < 2:
+            continue
+        row = conn.execute("SELECT url FROM jobs WHERE key=?", (key,)).fetchone()
+        keeper = link_id(row["url"]) if row and link_id(row["url"]) in links else links[0]
+        for job in same:
+            if link_id(job.url) != keeper:
+                job.uid = link_id(job.url)
 
 
 def connect(db_path: Path | None = None) -> sqlite3.Connection:
@@ -215,6 +250,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "role_score": "INTEGER NOT NULL DEFAULT 0", "skill_score": "INTEGER NOT NULL DEFAULT 0",
         "company_score": "INTEGER NOT NULL DEFAULT 0", "friction_score": "INTEGER NOT NULL DEFAULT 0",
         "score_reasons": "TEXT", "fit_score": "INTEGER", "fit_report_path": "TEXT",
+        "decision_reason": "TEXT",
         "resume_tex_path": "TEXT", "resume_pdf_path": "TEXT", "resume_generated_at": "INTEGER",
         "missing_since": "INTEGER", "url_checked_at": "INTEGER",
         "availability_status": "TEXT NOT NULL DEFAULT 'ACTIVE'",
@@ -261,30 +297,41 @@ def _migrate(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def _posted(new: int | None, old: int | None, first_seen: int | None) -> int | None:
+    """Earliest known post date, never after we first saw the job ("Posted Today" is scan time)."""
+    known = [v for v in (new, old) if v]
+    if not known:
+        return None
+    return min(known) if first_seen is None else min(*known, first_seen)
+
+
 def upsert(conn: sqlite3.Connection, jobs: list[Job]) -> tuple[int, int]:
     """Insert or refresh jobs. Returns (new, updated)."""
     now = int(time.time())
     new = updated = 0
+    split_same_title(conn, jobs)
     for job in jobs:
         key = job.key
         row = None
         if job.ats_vendor and job.ats_requisition_id:
             row = conn.execute(
-                "SELECT key, description, first_seen FROM jobs WHERE ats_vendor=? AND ats_requisition_id=?",
+                "SELECT key, source, url, description, first_seen, date_posted FROM jobs WHERE ats_vendor=? AND ats_requisition_id=?",
                 (job.ats_vendor, job.ats_requisition_id),
             ).fetchone()
         if row is None:
             row = conn.execute(
-                "SELECT key, description, first_seen FROM jobs WHERE key = ?", (key,)
+                "SELECT key, source, url, description, first_seen, date_posted FROM jobs WHERE key = ?", (key,)
             ).fetchone()
         if row is None:
             company_norm, title_norm = _slug(job.company), _title_slug(job.title)
             candidates = conn.execute(
-                """SELECT key,description,first_seen,normalized_company,normalized_title,
+                """SELECT key,source,description,first_seen,date_posted,normalized_company,normalized_title,
                           ats_vendor,ats_board,ats_requisition_id FROM jobs
                    WHERE normalized_company IS NOT NULL AND normalized_title IS NOT NULL"""
             ).fetchall()
             for candidate in candidates:
+                if candidate["source"] == job.source:
+                    continue  # one feed's own postings are told apart by key above
                 if (job.ats_requisition_id and candidate["ats_requisition_id"]
                         and (job.ats_vendor, job.ats_board, job.ats_requisition_id) != (
                             candidate["ats_vendor"], candidate["ats_board"],
@@ -302,14 +349,33 @@ def upsert(conn: sqlite3.Connection, jobs: list[Job]) -> tuple[int, int]:
                     break
         if row is not None:
             key = row["key"]
+        # Same feed, new link under an old key: a relisting, so it gets its own date.
+        relisted = (row is not None and row["source"] == job.source and "url" in row.keys()
+                    and link_id(row["url"]) != link_id(job.url))
+        if relisted and job.date_posted:
+            posted = job.date_posted
+        else:
+            posted = _posted(job.date_posted, row["date_posted"] if row else None,
+                             row["first_seen"] if row else now)
         payload = (
             job.source, job.company, job.title, job.url,
             "|".join(job.locations), job.category, "|".join(job.terms),
-            job.sponsorship, job.date_posted, job.tier, job.distance_mi,
+            job.sponsorship, posted, job.tier, job.distance_mi,
             job.place_label, job.ats_vendor, job.ats_board, job.ats_requisition_id,
             _slug(job.company), _title_slug(job.title),
         )
-        if row is None:
+        if row is not None and job.source in SIGHTING_ONLY_SOURCES and row["source"] != job.source:
+            # A LinkedIn card carries no category, season or sponsorship and links to LinkedIn
+            # instead of the employer. It confirms the job is still live; it must not replace
+            # the richer row another feed already owns.
+            conn.execute(
+                """UPDATE jobs SET last_seen=?, active=1, missing_since=NULL,
+                   availability_status='ACTIVE', date_posted=COALESCE(date_posted, ?)
+                   WHERE key=?""",
+                (now, posted, key),
+            )
+            updated += 1
+        elif row is None:
             conn.execute(
                 """INSERT INTO jobs (key, source, company, title, url, locations,
                    category, terms, sponsorship, date_posted, tier, distance_mi,
@@ -478,14 +544,67 @@ def set_saved(conn: sqlite3.Connection, job_key: str, saved: bool) -> bool:
     return cursor.rowcount > 0
 
 
-def mark_inactive_missing(conn: sqlite3.Connection, source: str, seen_keys: set[str]) -> int:
-    """Flag rows from `source` that upstream no longer lists."""
+def retire_filtered(conn: sqlite3.Connection, keep) -> int:
+    """Deactivate untouched rows the current relevance filter rejects.
+
+    Filters improve over time; without this, a row admitted by an older rule stays live until its
+    source drops it. Only NEW, unsaved rows are touched, never anything the user has acted on.
+    """
+    rows = conn.execute(
+        "SELECT * FROM jobs WHERE active=1 AND status='NEW' AND COALESCE(saved,0)=0"
+    ).fetchall()
+    rejected = []
+    for row in rows:
+        job = Job(
+            source=row["source"], company=row["company"], title=row["title"], url=row["url"],
+            locations=[x for x in (row["locations"] or "").split("|") if x],
+            category=row["category"], terms=[x for x in (row["terms"] or "").split("|") if x],
+            tier=row["tier"] if row["tier"] is not None else 0,
+        )
+        if not keep(job):
+            rejected.append(row["key"])
+    now = int(time.time())
+    conn.executemany(
+        """UPDATE jobs SET active=0, missing_since=COALESCE(missing_since, ?),
+           availability_status='FILTERED_OUT' WHERE key=?""",
+        [(now, key) for key in rejected],
+    )
+    conn.commit()
+    return len(rejected)
+
+
+def expire_unseen(conn: sqlite3.Connection, source: str, days: int) -> int:
+    """Deactivate `source` rows not sighted for `days`, for sources that are search samples.
+
+    A LinkedIn search returns a ranked slice, not the full listing, so absence from one run is not
+    evidence a job closed. Only a long run of absences is.
+    """
+    now = int(time.time())
+    cur = conn.execute(
+        """UPDATE jobs SET active=0, missing_since=COALESCE(missing_since, ?),
+           availability_status='NOT_SEEN_RECENTLY'
+           WHERE source=? AND active=1 AND last_seen < ?""",
+        (now, source, now - days * 86400),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def mark_inactive_missing(conn: sqlite3.Connection, source: str, seen_keys: set[str],
+                          since: int | None = None) -> int:
+    """Flag rows from `source` that upstream no longer lists.
+
+    With `since` (the run's start), a row counts as listed if this run touched it at all. Keys alone
+    miss rows that a sighting merged into under another feed's key, and those got deactivated
+    every run even though upstream still listed them.
+    """
     if not seen_keys:
         return 0
     rows = conn.execute(
-        "SELECT key FROM jobs WHERE source = ? AND active = 1", (source,)
+        "SELECT key, last_seen FROM jobs WHERE source = ? AND active = 1", (source,)
     ).fetchall()
-    stale = [r["key"] for r in rows if r["key"] not in seen_keys]
+    stale = [r["key"] for r in rows
+             if r["key"] not in seen_keys and (since is None or r["last_seen"] < since)]
     now = int(time.time())
     conn.executemany(
         """UPDATE jobs SET active = 0, missing_since=COALESCE(missing_since, ?),
@@ -521,6 +640,9 @@ def mark_inactive_missing_ats(conn: sqlite3.Connection, jobs: list[Job],
     return len(stale)
 
 
+# Sources whose rows are search samples: they confirm a job is live but never own its data.
+SIGHTING_ONLY_SOURCES = {"linkedin"}
+SEARCH_SAMPLE_EXPIRY_DAYS = 7
 # A source that answers HTTP 200 with a well-formed but frozen list looks
 # identical to a healthy one. Judge it on the newest posting it carries instead.
 STALE_SOURCE_DAYS = 14
@@ -633,7 +755,7 @@ def save_listing_metadata(conn: sqlite3.Connection, key: str, *,
                           date_posted: int | None = None,
                           applicant_count: int | None = None) -> None:
     conn.execute(
-        """UPDATE jobs SET date_posted=COALESCE(?,date_posted),
+        """UPDATE jobs SET date_posted=MIN(COALESCE(?,date_posted),first_seen),
            applicant_count=COALESCE(?,applicant_count) WHERE key=?""",
         (date_posted, applicant_count, key),
     )
@@ -675,14 +797,16 @@ def recompute_scores(conn: sqlite3.Connection) -> int:
 
 def save_artifacts(conn: sqlite3.Connection, key: str, *, fit_score: int | None = None,
                    fit_report_path: str | None = None, resume_tex_path: str | None = None,
-                   resume_pdf_path: str | None = None) -> bool:
+                   resume_pdf_path: str | None = None,
+                   decision_reason: str | None = None) -> bool:
     generated = int(time.time()) if resume_tex_path or resume_pdf_path else None
     cur = conn.execute(
         """UPDATE jobs SET fit_score=COALESCE(?,fit_score),
            fit_report_path=COALESCE(?,fit_report_path), resume_tex_path=COALESCE(?,resume_tex_path),
            resume_pdf_path=COALESCE(?,resume_pdf_path),
+           decision_reason=COALESCE(?,decision_reason),
            resume_generated_at=COALESCE(?,resume_generated_at) WHERE key=?""",
-        (fit_score, fit_report_path, resume_tex_path, resume_pdf_path, generated, key),
+        (fit_score, fit_report_path, resume_tex_path, resume_pdf_path, decision_reason, generated, key),
     )
     conn.commit()
     return cur.rowcount > 0

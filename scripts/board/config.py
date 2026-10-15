@@ -14,11 +14,7 @@ DEFAULTS = {
     "primary_label": "Primary area",
     "secondary_state": "",
     "secondary_label": "Secondary area",
-    "linkedin_queries": [
-        ["software engineer intern", "United States"],
-        ["data science intern", "United States"],
-        ["machine learning intern", "United States"],
-    ],
+    "linkedin_geos": ["United States"],
 }
 
 

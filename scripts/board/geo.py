@@ -200,7 +200,8 @@ CITY_COORDS = {
 }
 
 REMOTE_RE = re.compile(r"\b(remote|work from home|wfh|virtual|anywhere)\b", re.I)
-US_WORDS = {"usa", "us", "united states", "u.s.", "u.s.a.", "america", "nationwide"}
+US_WORDS = {"usa", "us", "united states", "united states of america", "u.s.", "u.s.a.",
+            "america", "nationwide"}
 
 # Only used to classify a bare country string as international.
 KNOWN_COUNTRIES = {
