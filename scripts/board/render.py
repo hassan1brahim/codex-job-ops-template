@@ -8,6 +8,7 @@ page, truncated so the file stays well inside the artifact size limit.
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,10 @@ from .store import (all_jobs, applied_at_map, latest_runs, recruiters_for,
                     sources_for, stats)
 
 DESC_LIMIT = 5000
+
+# Older postings are hidden unless already applied to.
+BOARD_SINCE = int(datetime(2026, 10, 1).timestamp())
+APPLIED_STATUSES = {"APPLIED", "OA", "INTERVIEW", "OFFER", "REJECTED"}
 
 TIER_META = {
     0: (TIER_LABELS[0], "primary", f"Primary search area near {HOME_LABEL}."),
@@ -34,17 +39,19 @@ SOURCE_LABEL = {
     "vansh": "vanshb03",
     "linkedin": "LinkedIn",
     "wellfound": "Wellfound",
-    "swelist": "swelist",
     "yc": "Y Combinator",
 }
 
 
-def _rows_payload(conn) -> list[dict]:
+def _rows_payload(conn, *, include_descriptions: bool = True) -> list[dict]:
     payload = []
     sightings = sources_for(conn)
     recruiters = recruiters_for(conn)
     applied = applied_at_map(conn)
     for row in all_jobs(conn, active_only=False):
+        if ((row["date_posted"] or row["first_seen"]) < BOARD_SINCE
+                and row["key"] not in applied and row["status"] not in APPLIED_STATUSES):
+            continue
         desc = row["description"] or ""
         seen = sightings.get(row["key"], [])
         payload.append(
@@ -69,11 +76,13 @@ def _rows_payload(conn) -> list[dict]:
                 "reasons": json.loads(row["score_reasons"] or "[]"),
                 "fit": row["fit_score"],
                 "report": row["fit_report_path"] or "",
+                "decision": row["decision_reason"] or "",
                 "tex": row["resume_tex_path"] or "",
                 "pdf": row["resume_pdf_path"] or "",
                 "ats": row["ats_vendor"] or "",
                 "live": row["availability_status"],
-                "d": desc[:DESC_LIMIT],
+                "d": desc[:DESC_LIMIT] if include_descriptions else "",
+                "hasD": bool(desc),
                 "dt": len(desc) > DESC_LIMIT,
                 "new": 1 if row["status"] == "NEW" else 0,
                 # Feed order key: real posting time when the source gave one,
@@ -104,6 +113,8 @@ def _rows_payload(conn) -> list[dict]:
 def _source_health(conn) -> list[dict]:
     out = []
     for run in latest_runs(conn):
+        if run["source"] not in SOURCE_LABEL:
+            continue
         age_h = (time.time() - run["ran_at"]) / 3600
         out.append(
             {
@@ -129,12 +140,14 @@ def _source_health(conn) -> list[dict]:
 
 
 def render(conn, out_path: Path, max_tier: int = 4) -> Path:
-    rows = [r for r in _rows_payload(conn) if r["tier"] <= max_tier]
+    # Descriptions are fetched only when a row opens. Embedding all of them made
+    # the initial document several megabytes larger and slowed every reload.
+    rows = [r for r in _rows_payload(conn, include_descriptions=False) if r["tier"] <= max_tier]
     health = _source_health(conn)
     counts: dict[int, int] = {}
     for row in rows:
         counts[row["tier"]] = counts.get(row["tier"], 0) + 1
-    described = sum(1 for r in rows if r["d"])
+    described = sum(1 for r in rows if r["hasD"])
     generated = datetime.now(timezone.utc).astimezone().strftime("%B %d, %Y at %-I:%M %p")
 
     tiers_js = json.dumps({str(k): [v[0], v[1], v[2]] for k, v in TIER_META.items()})
@@ -151,7 +164,14 @@ def render(conn, out_path: Path, max_tier: int = 4) -> Path:
     html = html.replace("__AUTH__", profile_summary())
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(html, encoding="utf-8")
+    # A background refresh must never expose a half-written multi-megabyte page.
+    with tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=out_path.parent,
+        prefix=f".{out_path.name}.", suffix=".tmp", delete=False,
+    ) as handle:
+        handle.write(html)
+        temporary = Path(handle.name)
+    temporary.replace(out_path)
     return out_path
 
 
@@ -236,10 +256,10 @@ h1{
 .controls{
   position:sticky; top:0; z-index:20; background:var(--paper);
   padding-block:14px; border-bottom:1px solid var(--line);
-  display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+  display:grid; grid-template-columns:minmax(0,1fr); gap:10px;
 }
 #q{
-  flex:1 1 240px; min-width:0; padding:9px 12px; font:inherit; font-size:16.5px;
+  width:100%; min-width:0; padding:9px 12px; font:inherit; font-size:16.5px;
   color:var(--ink); background:var(--surface);
   border:1px solid var(--line-2); border-radius:3px;
 }
@@ -247,7 +267,7 @@ h1{
 #q:focus-visible,.pill:focus-visible,.row:focus-visible,.ghost:focus-visible{
   outline:2px solid var(--focus); outline-offset:2px
 }
-.pills{display:flex; flex-wrap:wrap; gap:6px}
+.toolbar{display:flex; flex-wrap:wrap; gap:6px; align-items:center}
 .pill{
   font:inherit; font-size:14.2px; font-weight:500; cursor:pointer;
   padding:7px 11px; border-radius:3px; border:1px solid var(--line-2);
@@ -260,6 +280,33 @@ label.pill select{
   font:inherit; font-size:13.6px; background:none; color:inherit;
   border:0; cursor:pointer; padding:0
 }
+.pill.primary{border-color:var(--nj); color:var(--nj)}
+.pill.primary[aria-pressed="true"]{background:var(--nj); border-color:var(--nj); color:#071512}
+.filter-menu{position:relative}
+.filter-menu summary{display:inline-flex; align-items:center; gap:6px; list-style:none}
+.filter-menu summary::-webkit-details-marker{display:none}
+.filter-menu summary::after{content:"▾"; color:var(--ink-3); font-size:11px}
+.filter-menu[open] summary{border-color:var(--ink-2); color:var(--ink)}
+.filter-panel{
+  position:absolute; right:0; top:calc(100% + 7px); z-index:30; min-width:240px;
+  display:grid; gap:7px; padding:10px; border:1px solid var(--line-2);
+  border-radius:4px; background:var(--surface); box-shadow:var(--shadow)
+}
+.filter-panel .pill{width:100%; text-align:left}
+.filter-panel .zoomer{display:flex; align-items:center; justify-content:space-between; cursor:default}
+.filter-panel .zoomer button{min-width:28px}
+.active-filter-count:empty{display:none}
+.active-filter-count{font-family:"IBM Plex Mono",monospace; color:var(--nj)}
+.pager{
+  display:flex; flex-wrap:wrap; align-items:center; gap:7px; padding:10px 0;
+  border-bottom:1px solid var(--line); color:var(--ink-3); font-size:13.6px
+}
+.pager .summary{margin-right:auto; font-family:"IBM Plex Mono",monospace}
+.pager button{min-width:68px}
+.pager button:disabled{opacity:.42; cursor:not-allowed}
+.pager label{display:inline-flex; align-items:center; gap:5px}
+.pager select{font:inherit; color:inherit; background:var(--surface); border:1px solid var(--line-2); border-radius:3px; padding:5px}
+.saving{opacity:.62}
 
 /* ---------- tier sections ---------- */
 .tier{margin-top:34px}
@@ -432,6 +479,8 @@ label.pill select{
 .location-tag{color:var(--accent);background:var(--accent-wash);border-color:transparent;margin-left:0;margin-right:7px}
 .why{margin:12px 0;padding:0;list-style:none;display:flex;flex-wrap:wrap;gap:6px}
 .why li{font-size:14.2px;background:var(--surface);border:1px solid var(--line);padding:4px 7px;border-radius:2px}
+.decision{margin:10px 0;padding:9px 11px;border-left:3px solid var(--accent);background:var(--surface);font-size:15px}
+.decision.skip{border-left-color:var(--flag);background:var(--flag-wash);color:var(--ink)}
 .status-select{font:inherit;font-size:14.2px;padding:7px 9px;color:var(--ink);background:var(--surface);border:1px solid var(--line-2);border-radius:3px}
 
 /* ---------- expanded detail ---------- */
@@ -482,6 +531,9 @@ kbd{
   border:1px solid var(--line-2); border-bottom-width:2px; border-radius:3px; padding:1px 5px; color:var(--ink-2)
 }
 @media (max-width:720px){
+  .toolbar{display:grid; grid-template-columns:repeat(2,minmax(0,1fr))}
+  .toolbar>.pill,.toolbar>label.pill,.toolbar>.filter-menu,.filter-menu>summary{width:100%}
+  .filter-menu{grid-column:1/-1}.filter-panel{position:static; margin-top:6px}
   .row{grid-template-columns:74px minmax(0,1fr) 58px 150px;gap:4px 12px}
   .when{grid-column:1;font-size:15.3px}.co,.ti,.lo{grid-column:2/3}
   .fit{grid-column:3/4;grid-row:1}.marks{grid-column:4/5;grid-row:1}
@@ -509,12 +561,11 @@ kbd{
 
 <div class="controls">
   <input id="q" type="search" placeholder="Search company, role, or city" autocomplete="off">
-  <div class="pills" id="tierPills"></div>
-  <div class="pills">
-    <button class="pill" id="fDesc" aria-pressed="false" type="button">Has description</button>
-    <button class="pill" id="fUnseen" aria-pressed="false" type="button">Unseen <span class="c" id="unseenCount"></span></button>
-    <button class="pill" id="fRec" aria-pressed="false" type="button">Has recruiter <span class="c" id="recCount"></span></button>
-    <button class="pill" id="fDone" aria-pressed="false" type="button">Done <span class="c" id="doneCount"></span></button>
+  <div class="toolbar">
+    <label class="pill" for="scope">Browse
+      <select id="scope" aria-label="Browse jobs by location or workflow"></select>
+    </label>
+    <button class="pill primary" id="fReady" aria-pressed="false" type="button">Resume ready <span class="c" id="readyCount"></span></button>
     <label class="pill" for="sort">Sort
       <select id="sort" aria-label="Sort order">
         <option value="new">Newest</option>
@@ -522,11 +573,6 @@ kbd{
         <option value="near">Closest</option>
       </select>
     </label>
-    <span class="pill zoomer">Zoom
-      <button type="button" id="zoomOut" aria-label="Smaller">&minus;</button>
-      <span id="zoomNow">100%</span>
-      <button type="button" id="zoomIn" aria-label="Bigger">+</button>
-    </span>
     <label class="pill" for="view">View
       <select id="view" aria-label="Which jobs to show">
         <option value="active">Active</option>
@@ -534,8 +580,34 @@ kbd{
         <option value="all">All</option>
       </select>
     </label>
+    <details class="filter-menu">
+      <summary class="pill">More filters <span class="active-filter-count" id="moreCount"></span></summary>
+      <div class="filter-panel">
+        <button class="pill" id="fDesc" aria-pressed="false" type="button">Has description</button>
+        <button class="pill" id="fUnseen" aria-pressed="false" type="button">Unseen <span class="c" id="unseenCount"></span></button>
+        <button class="pill" id="fRec" aria-pressed="false" type="button">Has recruiter <span class="c" id="recCount"></span></button>
+        <span class="pill zoomer">Zoom
+          <button type="button" id="zoomOut" aria-label="Smaller">&minus;</button>
+          <span id="zoomNow">100%</span>
+          <button type="button" id="zoomIn" aria-label="Bigger">+</button>
+        </span>
+      </div>
+    </details>
   </div>
 </div>
+
+<nav class="pager" aria-label="Job result pages">
+  <span class="summary" id="pageSummary"></span>
+  <label for="pageSize">Rows
+    <select id="pageSize" aria-label="Rows per page">
+      <option value="50">50</option>
+      <option value="100">100</option>
+      <option value="200">200</option>
+    </select>
+  </label>
+  <button class="pill" id="pagePrev" type="button">Previous</button>
+  <button class="pill" id="pageNext" type="button">Next</button>
+</nav>
 
 <main id="board"></main>
 
@@ -552,7 +624,8 @@ const ROWS = __ROWS__;
 const TIERS = __TIERS__;
 const HEALTH = __HEALTH__;
 const state = {q:"", chip:"all", sort:"new", view:"active",
-               desc:false, unseen:false, rec:false, done:false, open:null};
+               desc:false, unseen:false, rec:false, ready:false, open:null,
+               page:0, pageSize:50};
 const STATUSES = ["NEW","EVALUATING","RESUME_GENERATING","READY_TO_APPLY","APPLIED","OA","INTERVIEW","OFFER","REJECTED","WITHDRAWN"];
 const REC_STATES = [["none","None"],["found","Found recruiter"],["messaged","Messaged"],["replied","Replied"]];
 const LATEST_HOURS = 6;
@@ -563,16 +636,16 @@ const esc = s => String(s==null?"":s).replace(/[&<>"']/g, c =>
 const now = () => Date.now()/1000;
 
 /* ---------- derived state ---------- */
-const doneKeys = new Set();
-function refreshDoneKeys(){
-  doneKeys.clear();
-  const donePdfs = new Set();
+const readyKeys = new Set();
+function refreshReadyKeys(){
+  readyKeys.clear();
+  const readyPdfs = new Set();
   ROWS.forEach(r => {
-    if (r.st !== "READY_TO_APPLY" || !r.pdf || donePdfs.has(r.pdf)) return;
-    donePdfs.add(r.pdf);
-    doneKeys.add(r.k);
+    if (r.st !== "READY_TO_APPLY" || !r.pdf || readyPdfs.has(r.pdf)) return;
+    readyPdfs.add(r.pdf);
+    readyKeys.add(r.k);
   });
-  document.getElementById("doneCount").textContent = doneKeys.size;
+  document.getElementById("readyCount").textContent = readyKeys.size;
 }
 const FOLLOWUP_DAYS = 5;
 /* Something is waiting on you when an application or a message has gone quiet.
@@ -613,15 +686,37 @@ function chipCounts(){
   });
   return c;
 }
-const pills = document.getElementById("tierPills");
-function paintChips(){
+const scope = document.getElementById("scope");
+const scopeOptions = new Map();
+function addScopeOption(parent,id,label){
+  const el = document.createElement("option");
+  el.value = id;
+  el.dataset.label = label;
+  parent.appendChild(el);
+  scopeOptions.set(id,el);
+}
+function initScope(){
+  addScopeOption(scope,"all","All jobs");
+  addScopeOption(scope,"new","New");
+  const locations = document.createElement("optgroup");
+  locations.label = "Location";
+  Object.keys(TIERS).forEach(t => addScopeOption(locations,t,TIERS[t][0]));
+  scope.appendChild(locations);
+  const workflow = document.createElement("optgroup");
+  workflow.label = "Workflow";
+  [["saved","Saved"],["applied","Applied"],["followup","Follow up"],["tailor","Tailor queue"]]
+    .forEach(([id,label]) => addScopeOption(workflow,id,label));
+  scope.appendChild(workflow);
+}
+function refreshControls(){
   const c = chipCounts();
-  const chip = (id,label,n) => '<button class="pill" data-chip="'+id+'" type="button" aria-pressed="'
-    + (state.chip===id) + '">' + esc(label) + '<span class="c">'+n+'</span></button>';
-  pills.innerHTML = chip("all","All",c.all) + chip("new","New",c.new)
-    + Object.keys(TIERS).filter(t=>c[t]).map(t=>chip(t,TIERS[t][0],c[t])).join("")
-    + chip("saved","Saved",c.saved) + chip("applied","Applied",c.applied)
-    + chip("followup","Follow up",c.followup) + chip("tailor","Tailor queue",c.tailor);
+  scopeOptions.forEach((el,id) => {
+    const next = el.dataset.label+" ("+(c[id]||0)+")";
+    if (el.textContent !== next) el.textContent = next;
+    el.hidden = id !== "all" && id !== "new" && /^\d+$/.test(id) && !c[id];
+  });
+  if (scope.value !== state.chip) scope.value = state.chip;
+  document.getElementById("moreCount").textContent = [state.desc,state.unseen,state.rec].filter(Boolean).length || "";
 }
 
 function match(r){
@@ -639,10 +734,10 @@ function match(r){
   else if (state.chip === "followup"){ if (!needsFollowUp(r)) return false; }
   else if (state.chip === "tailor"){ if (!r.reqAt || r.pdf) return false; }
   else if (state.chip !== "all"){ if (r.tier !== Number(state.chip)) return false; }
-  if (state.desc && !r.d) return false;
+  if (state.desc && !r.hasD) return false;
   if (state.unseen && r.seen) return false;
   if (state.rec && recState(r) === "none") return false;
-  if (state.done && !(doneKeys.has(r.k) && r.st === "READY_TO_APPLY" && r.pdf)) return false;
+  if (state.ready && !(readyKeys.has(r.k) && r.st === "READY_TO_APPLY" && r.pdf)) return false;
   if (state.q){
     const hay = (r.c+" "+r.t+" "+r.p+" "+r.s).toLowerCase();
     if (!state.q.split(/\s+/).every(w => hay.includes(w))) return false;
@@ -715,7 +810,8 @@ function recruiterForm(r){
     +   '<label>Message thread<input type="url" name="msg" value="'+esc(c.msg)+'" placeholder="https://linkedin.com/messaging/..."></label>'
     +   '<label>Date contacted<input type="date" name="at" value="'+esc(date)+'"></label>'
     +   '<label>Notes<textarea name="notes" placeholder="University recruiter for SWE interns...">'+esc(c.notes)+'</textarea></label>'
-    +   '<button class="ghost" type="submit">Save contact</button>'
+    +   '<button class="ghost'+(r.pendingRec?' saving':'')+'" type="submit"'
+    +     (r.pendingRec?' disabled':'')+'>'+(r.pendingRec?'Saving…':'Save contact')+'</button>'
     + '</div></form>';
 }
 
@@ -732,10 +828,16 @@ function detailHTML(r){
   meta.push("Discovered "+age(r.discovered));
   const body = r.d
     ? '<div class="body">'+esc(r.d)+(r.dt?"\n\n[truncated - open the posting for the full text]":"")+'</div>'
+    : r.hasD
+    ? '<p class="none">'+(r.descError?'Description could not be loaded. Restart the board server and reopen this job.':'Loading description…')+'</p>'
     : '<p class="none">No description cached yet. Run <code class="cmd">python scripts/jobboard.py describe</code> to fetch it.</p>';
   const why = r.reasons.length ? '<ul class="why">'+r.reasons.map(x=>'<li>+ '+esc(x)+'</li>').join("")+'</ul>' : '';
   const localHref = p => /^(https?:|file:|\/)/.test(p) ? p : "../"+p;
   const report = r.report ? '<a class="ghost" href="'+esc(localHref(r.report))+'">Fit report</a>' : '';
+  const decision = r.decision
+    ? '<p class="decision '+(r.st === "WITHDRAWN" ? "skip" : "")+'"><strong>'
+      +(r.st === "WITHDRAWN" ? "Do not apply: " : "Recommendation: ")+'</strong>'+esc(r.decision)+'</p>'
+    : '';
   const resume = r.pdf ? '<a class="ghost" href="'+esc(localHref(r.pdf))+'">Resume PDF</a>' : '';
   const options = STATUSES.map(s=>'<option value="'+s+'"'+(s===r.st?' selected':'')+'>'+s.replaceAll("_"," ")+'</option>').join("");
   const sightings = (r.srcs||[]).map(x =>
@@ -743,12 +845,15 @@ function detailHTML(r){
     + ' <span class="none">first seen '+age(x.first_seen||r.discovered)+'</span></li>').join("");
   return '<div class="detail">'
     + '<div class="meta">'+meta.map(m=>"<span>"+m+"</span>").join("")+'</div>'
-    + '<strong>Why it ranked here</strong>'+why+body
+    + decision+'<strong>Why it ranked here</strong>'+why+body
     + '<div class="track">'
     +   '<div><h4>Application</h4>'
-    +     '<label><input type="checkbox" data-applied="'+esc(r.k)+'"'+(isApplied(r)?" checked":"")+'> Applied</label>'
-    +     '<label><input type="checkbox" data-saved="'+esc(r.k)+'"'+(r.saved?" checked":"")+'> Saved for later</label>'
-    +     '<label>Pipeline <select class="status-select" data-status="'+esc(r.k)+'">'+options+'</select></label>'
+    +     '<label class="'+(r.pendingStatus?'saving':'')+'"><input type="checkbox" data-applied="'+esc(r.k)+'"'
+    +       (isApplied(r)?" checked":"")+(r.pendingStatus?' disabled':'')+'> '+(r.pendingStatus?'Saving…':'Applied')+'</label>'
+    +     '<label class="'+(r.pendingSaved?'saving':'')+'"><input type="checkbox" data-saved="'+esc(r.k)+'"'
+    +       (r.saved?" checked":"")+(r.pendingSaved?' disabled':'')+'> '+(r.pendingSaved?'Saving…':'Saved for later')+'</label>'
+    +     '<label>Pipeline <select class="status-select" data-status="'+esc(r.k)+'"'
+    +       (r.pendingStatus?' disabled':'')+'>'+options+'</select></label>'
     +   '</div>'
     +   '<div>'+recruiterForm(r)+'</div>'
     +   '<div><h4>Sources</h4><ul class="why">'+sightings+'</ul></div>'
@@ -756,22 +861,38 @@ function detailHTML(r){
     + '<div class="acts">'
     +   '<a class="btn" href="'+esc(r.canon||r.u)+'" target="_blank" rel="noopener">Open application ↗</a>'
     + report + resume
-    +   '<button class="ghost tailor'+(r.reqAt?" on":"")+'" type="button" data-tailor="'+esc(r.k)+'">'
-    +     (r.reqAt ? "Cancel resume request" : "Tailor my resume for this")+'</button>'
+    +   '<button class="ghost tailor'+(r.reqAt?" on":"")+(r.pendingTailor?' saving':'')
+    +     '" type="button" data-tailor="'+esc(r.k)+'"'+(r.pendingTailor?' disabled':'')+'>'
+    +     (r.pendingTailor ? "Saving…" : r.reqAt ? "Cancel resume request" : "Tailor my resume for this")+'</button>'
     +   '<button class="ghost" type="button" data-copy="python scripts/jobboard.py requests">Copy agent handoff</button>'
     + '</div></div>';
 }
 
 /* ---------- feed ---------- */
+function refreshPager(total){
+  const pages = Math.max(1,Math.ceil(total/state.pageSize));
+  state.page = Math.min(state.page,pages-1);
+  const start = total ? state.page*state.pageSize+1 : 0;
+  const end = Math.min(total,(state.page+1)*state.pageSize);
+  document.getElementById("pageSummary").textContent = total
+    ? "Showing "+start+"–"+end+" of "+total
+    : "No matching jobs";
+  document.getElementById("pagePrev").disabled = state.page === 0;
+  document.getElementById("pageNext").disabled = state.page >= pages-1;
+  document.getElementById("pageSize").value = String(state.pageSize);
+}
+
 function render(){
   const board = document.getElementById("board");
-  paintChips();
+  refreshControls();
   refreshCounts();
-  const shown = ROWS.filter(match).sort(SORTS[state.sort]);
-  if (!shown.length){
+  const matched = ROWS.filter(match).sort(SORTS[state.sort]);
+  refreshPager(matched.length);
+  if (!matched.length){
     board.innerHTML = '<p class="empty">Nothing matches that filter.</p>';
     return;
   }
+  const shown = matched.slice(state.page*state.pageSize,(state.page+1)*state.pageSize);
   const rowHTML = r => {
     const open = state.open === r.k;
     const hot = now()-r.when < 6*3600;
@@ -790,22 +911,26 @@ function render(){
         + (recAt ? " " + esc(age(recAt)) : "")+'</span>';
     const warn = r.sp ? '<span class="tag warn">'+esc(r.sp)+'</span>' : '';
     const ready = r.st === "READY_TO_APPLY" ? '<span class="tag ready">Ready</span>' : '';
+    const skip = r.st === "WITHDRAWN" && r.decision
+      ? '<span class="tag warn" title="'+esc(r.decision)+'">Do not apply</span>' : '';
     return '<div class="row'+(r.seen?" is-seen":"")+'" role="button" tabindex="0" data-k="'+esc(r.k)+'" '
       + 'data-t="'+r.tier+'" aria-expanded="'+open+'">'
       + '<span class="when'+(hot&&!applied?" hot":"")+(applied?" applied":"")+'">'+esc(age(leadStamp))
       +   '<small>'+leadLabel+'</small></span>'
       + '<span class="co">'+esc(r.c)+'</span>'
-      + '<span class="ti">'+esc(r.t)+warn+ready+'</span>'
+      + '<span class="ti">'+esc(r.t)+warn+ready+skip+'</span>'
       + '<span class="lo">'+esc(r.p)+(r.mi!=null?" · "+r.mi+" mi":"")+'<br>'+sourcePills(r)+recChip
       +   (r.applicants != null ? '<span class="none">'+r.applicants+'+ applicants</span>' : '')+'</span>'
       + '<span class="fit">'+r.score+'<small>fit</small></span>'
-      + '<span class="marks">'+(r.d?'<span class="doc" title="Description cached">JD</span>':'')
-      +   '<label class="applied-check"><input type="checkbox" data-applied="'+esc(r.k)+'" '
-      +   'aria-label="Mark '+esc(r.c)+' applied"'+(isApplied(r)?" checked":"")+'>Applied</label>'
-      +   '<button class="tailor'+(r.reqAt?" on":"")+'" type="button" data-tailor="'+esc(r.k)+'" '
+      + '<span class="marks">'+(r.hasD?'<span class="doc" title="Description cached">JD</span>':'')
+      +   '<label class="applied-check'+(r.pendingStatus?' saving':'')+'"><input type="checkbox" data-applied="'+esc(r.k)+'" '
+      +   'aria-label="Mark '+esc(r.c)+' applied"'+(isApplied(r)?" checked":"")
+      +   (r.pendingStatus?' disabled':'')+'>'+(r.pendingStatus?'Saving…':'Applied')+'</label>'
+      +   '<button class="tailor'+(r.reqAt?" on":"")+(r.pendingTailor?' saving':'')+'" type="button" data-tailor="'+esc(r.k)+'" '
+      +   (r.pendingTailor?'disabled ':'')
       +     'title="'+(r.pdf ? "Tailored resume ready" : r.reqAt ? "Requested - click to cancel"
                        : "Ask Claude/Codex to tailor a resume for this role")+'">'
-      +     (r.pdf ? "Resume ✓" : r.reqAt ? "Queued" : "Tailor")+'</button>'
+      +     (r.pendingTailor ? "Saving…" : r.pdf ? "Resume ✓" : r.reqAt ? "Queued" : "Tailor")+'</button>'
       +   '<a class="quick-apply" href="'+esc(r.canon||r.u)+'" target="_blank" rel="noopener">Apply ↗</a></span>'
       + '</div>'
       + (open ? detailHTML(r) : "");
@@ -821,7 +946,7 @@ function render(){
   }
   const groups = {};
   shown.forEach(r => (groups[bucketOf(r)] = groups[bucketOf(r)] || []).push(r));
-  const last24 = shown.filter(r => now()-r.when <= DAY).length;
+  const last24 = matched.filter(r => now()-r.when <= DAY).length;
   board.innerHTML = BUCKET_ORDER.filter(b => groups[b]).map(b => {
     // A bucket holds jobs placed by posting date and jobs placed by discovery
     // date. Saying "posted" for both would claim a date the source never gave,
@@ -876,11 +1001,30 @@ function notifyUnreachable(fallbackCommand){
   }
 }
 
+async function loadDescription(r){
+  if (!r.hasD || r.d || r.pendingDesc) return;
+  r.pendingDesc = true;
+  try{
+    const response = await fetch("/api/description?key="+encodeURIComponent(r.k));
+    if (!response.ok) throw new Error("description unavailable");
+    const payload = await response.json();
+    r.d = payload.description || "";
+    r.dt = Boolean(payload.truncated);
+    r.descError = false;
+  }catch(_){
+    r.descError = true;
+  }finally{
+    r.pendingDesc = false;
+    if (state.open === r.k) render();
+  }
+}
+
 /* Opening a row is what marks it seen, so "Unseen" means genuinely unread. */
 async function markSeen(r){
   if (r.seen) return;
   r.seen = 1;
-  await post("/api/triage",{key:r.k,seen:true},null);
+  const ok = await post("/api/triage",{key:r.k,seen:true},null);
+  if (!ok){ r.seen = 0; render(); }
 }
 
 document.getElementById("board").addEventListener("click", async e => {
@@ -893,15 +1037,19 @@ document.getElementById("board").addEventListener("click", async e => {
       alert("A tailored resume already exists for this role:\n\n"+row.pdf);
       return;
     }
+    if (!row || row.pendingTailor) return;
     const wanted = !(row && row.reqAt);
-    tailor.disabled = true;
+    const previous = {reqAt:row.reqAt,st:row.st};
+    row.reqAt = wanted ? Math.floor(now()) : null;
+    if (wanted && row.st === "NEW") row.st = "EVALUATING";
+    row.pendingTailor = true;
+    render();
     const ok = await post("/api/request-resume", {key, wanted},
       `python scripts/jobboard.py queue ${key}`);
-    tailor.disabled = false;
-    if (!ok) return;
-    if (row){
-      row.reqAt = wanted ? Math.floor(now()) : null;
-      if (wanted && row.st === "NEW") row.st = "EVALUATING";
+    row.pendingTailor = false;
+    if (!ok){
+      row.reqAt = previous.reqAt;
+      row.st = previous.st;
     }
     render();
     return;
@@ -919,11 +1067,13 @@ document.getElementById("board").addEventListener("click", async e => {
   if (!row) return;
   const key = row.dataset.k;
   state.open = state.open === key ? null : key;
+  let opened = null;
   if (state.open){
-    const r = ROWS.find(x => x.k === key);
-    if (r) markSeen(r);
+    opened = ROWS.find(x => x.k === key);
+    if (opened) markSeen(opened);
   }
   render();
+  if (opened) loadDescription(opened);
 });
 
 document.getElementById("board").addEventListener("keydown", e => {
@@ -933,11 +1083,13 @@ document.getElementById("board").addEventListener("keydown", e => {
   e.preventDefault();
   const key = row.dataset.k;
   state.open = state.open === key ? null : key;
+  let opened = null;
   if (state.open){
-    const r = ROWS.find(x => x.k === key);
-    if (r) markSeen(r);
+    opened = ROWS.find(x => x.k === key);
+    if (opened) markSeen(opened);
   }
   render();
+  if (opened) loadDescription(opened);
 });
 
 document.getElementById("board").addEventListener("change", async e => {
@@ -956,27 +1108,35 @@ document.getElementById("board").addEventListener("change", async e => {
   if (saved){
     const key = saved.dataset.saved;
     const row = ROWS.find(r => r.k === key);
+    if (!row || row.pendingSaved) return;
     const want = saved.checked;
+    const previous = row.saved;
+    row.saved = want ? 1 : 0;
+    row.pendingSaved = true;
+    render();
     const ok = await post("/api/triage",{key,saved:want},
       `python scripts/jobboard.py save ${key} ${want?"on":"off"}`);
-    if (!ok){ saved.checked = !want; return; }
-    if (row) row.saved = want ? 1 : 0;
+    row.pendingSaved = false;
+    if (!ok) row.saved = previous;
     render();
     return;
   }
 
   const key = applied ? applied.dataset.applied : select.dataset.status;
   const status = applied ? (applied.checked ? "APPLIED" : "NEW") : select.value;
+  const row = ROWS.find(r => r.k === key);
+  if (!row || row.pendingStatus) return;
+  const targets = ROWS.filter(other => other.k === key || (row.pdf && other.pdf === row.pdf));
+  const previous = targets.map(other => [other,other.st]);
+  targets.forEach(other => { other.st = status; other.pendingStatus = true; });
+  refreshReadyKeys();
+  if (status === "APPLIED" && state.ready) state.open = null;
+  render();
   const command = `python scripts/jobboard.py set-status ${key} ${status}`;
   const ok = await post("/api/status",{key,status},command);
-  if (!ok){ if (applied) applied.checked = !applied.checked; return; }
-  const row = ROWS.find(r => r.k === key);
-  if (row){
-    ROWS.filter(other => other.k === key || (row.pdf && other.pdf === row.pdf))
-      .forEach(other => { other.st = status; });
-  }
-  refreshDoneKeys();
-  if (status === "APPLIED" && state.done) state.open = null;
+  targets.forEach(other => { other.pendingStatus = false; });
+  if (!ok) previous.forEach(([other,oldStatus]) => { other.st = oldStatus; });
+  refreshReadyKeys();
   render();
 });
 
@@ -997,42 +1157,55 @@ document.getElementById("board").addEventListener("submit", async e => {
     contacted_at: date ? Math.floor(new Date(date+"T12:00:00").getTime()/1000) : null,
     notes: data.get("notes") || "",
   };
-  const result = await post("/api/recruiter", payload, null);
-  if (!result) return;
   const row = ROWS.find(r => r.k === payload.key);
-  if (row){
+  if (!row || row.pendingRec) return;
+  const previous = (row.rec||[]).map(contact => ({...contact}));
+  row.rec = [{id:payload.id, name:payload.name, profile:payload.profile_url,
+              msg:payload.message_url, status:payload.status,
+              at:payload.contacted_at, notes:payload.notes}];
+  row.pendingRec = true;
+  render();
+  const result = await post("/api/recruiter", payload, null);
+  row.pendingRec = false;
+  if (result){
     row.rec = [{id:result.id, name:payload.name, profile:payload.profile_url,
                 msg:payload.message_url, status:payload.status,
                 at:payload.contacted_at, notes:payload.notes}];
-  }
+  } else row.rec = previous;
   render();
 });
 
 /* ---------- controls ---------- */
-pills.addEventListener("click", e => {
-  const b = e.target.closest(".pill"); if (!b || !b.dataset.chip) return;
-  state.chip = b.dataset.chip;
-  render();
-});
+function resetAndRender(){ state.page = 0; state.open = null; render(); }
+scope.addEventListener("change", e => { state.chip = e.target.value; resetAndRender(); });
 
 function toggle(id, key){
   const el = document.getElementById(id);
   el.addEventListener("click", () => {
     state[key] = !state[key];
     el.setAttribute("aria-pressed", state[key]);
-    render();
+    resetAndRender();
   });
 }
 toggle("fDesc","desc");
 toggle("fUnseen","unseen");
 toggle("fRec","rec");
-toggle("fDone","done");
+toggle("fReady","ready");
 
 document.getElementById("sort").addEventListener("change", e => {
-  state.sort = e.target.value; render();
+  state.sort = e.target.value; resetAndRender();
 });
 document.getElementById("view").addEventListener("change", e => {
-  state.view = e.target.value; render();
+  state.view = e.target.value; resetAndRender();
+});
+document.getElementById("pageSize").addEventListener("change", e => {
+  state.pageSize = Number(e.target.value); state.page = 0; render();
+});
+document.getElementById("pagePrev").addEventListener("click", () => {
+  if (state.page > 0){ state.page--; state.open = null; render(); }
+});
+document.getElementById("pageNext").addEventListener("click", () => {
+  state.page++; state.open = null; render();
 });
 
 /* ---------- zoom ----------
@@ -1060,7 +1233,14 @@ document.getElementById("zoomOut").addEventListener("click", () => {
 applyZoom();
 
 const q = document.getElementById("q");
-q.addEventListener("input", () => { state.q = q.value.trim().toLowerCase(); render(); });
+let searchTimer = null;
+q.addEventListener("input", () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(() => {
+    state.q = q.value.trim().toLowerCase();
+    resetAndRender();
+  },120);
+});
 document.addEventListener("keydown", e => {
   if (e.key === "/" && document.activeElement !== q){ e.preventDefault(); q.focus(); }
   if (e.key === "Escape" && state.open){ state.open = null; render(); }
@@ -1091,7 +1271,8 @@ document.getElementById("srcs").innerHTML = HEALTH.map(h => {
     + '</div></div>';
 }).join("");
 
-refreshDoneKeys();
+initScope();
+refreshReadyKeys();
 render();
 </script>
 """

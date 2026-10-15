@@ -11,7 +11,8 @@ cd "$REPO" || exit 1
 
 echo "=== $(date '+%Y-%m-%d %H:%M:%S') jobboard daily ==="
 
-"$PY" scripts/jobboard.py refresh || echo "refresh failed"
+# Workday/SmartRecruiters have their own two-hour sweep; do not duplicate it here.
+"$PY" scripts/jobboard.py refresh --sources ats simplify vansh linkedin yc || echo "refresh failed"
 
 # Descriptions only for the configured preferred/remote tiers. Rate limited,
 # so this is the slow step: roughly one job every 2-4 seconds.
@@ -20,9 +21,6 @@ echo "=== $(date '+%Y-%m-%d %H:%M:%S') jobboard daily ==="
 # Automatically hand only the strongest new roles to the existing Codex queue.
 "$PY" scripts/jobboard.py autoqueue --limit 8 --min-score 75 --tier 3 --max-age-hours 14 || echo "autoqueue failed"
 "$PY" scripts/jobboard.py check-urls --limit 30 --older-than 24 || echo "URL check failed"
-
-# One isolated Codex worker evaluates the top queued role. It never submits an application.
-"$PY" scripts/jobboard.py process --limit 1 || echo "Codex processing paused or failed"
 
 "$PY" scripts/jobboard.py render || echo "render failed"
 

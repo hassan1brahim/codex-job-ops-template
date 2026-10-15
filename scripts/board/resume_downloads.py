@@ -34,15 +34,27 @@ def _source_path(value: str) -> Path:
 
 
 def sync_ready_resumes(conn, download_dir: Path | None = None) -> dict[str, int | str]:
-    """Copy ready PDFs to Downloads and remove only previously managed stale copies."""
+    """Add newly ready PDFs without reconciling or deleting Downloads.
+
+    A desired filename already present in the manifest but absent from Downloads is
+    treated as a user deletion.  It remains in the manifest so later syncs continue
+    to respect that choice.  A resume that has never been managed is still copied
+    on its first sync. Existing Downloads files are never removed when workflow
+    status changes.
+    """
 
     target = (download_dir or DEFAULT_DOWNLOAD_DIR).expanduser()
     target.mkdir(parents=True, exist_ok=True)
     manifest_path = target / MANIFEST_NAME
     try:
-        previous = json.loads(manifest_path.read_text(encoding="utf-8")).get("files", {})
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        previous = manifest.get("files", {})
+        # Version 1 manifests only contained ``files``. Those entries came from
+        # completed syncs, so treat them as delivered during the migration.
+        delivered = set(manifest.get("delivered", previous))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         previous = {}
+        delivered = set()
 
     desired: dict[str, str] = {}
     seen_sources: set[str] = set()
@@ -68,33 +80,37 @@ def sync_ready_resumes(conn, download_dir: Path | None = None) -> dict[str, int 
         desired[filename] = relative
 
     copied = 0
+    suppressed = 0
     errors = 0
+    managed: set[str] = set(delivered)
     for filename, source_value in desired.items():
         source = _source_path(source_value)
         destination = target / filename
         try:
+            if not destination.exists() and filename in delivered:
+                suppressed += 1
+                managed.add(filename)
+                continue
             if not destination.exists() or not filecmp.cmp(source, destination, shallow=False):
                 shutil.copy2(source, destination)
                 copied += 1
+            managed.add(filename)
         except OSError:
             # A background launchd process may lack macOS privacy permission for
             # Downloads. Tracker/status writes must still succeed; a later manual
             # `sync-resumes` run can reconcile upload copies from the terminal.
             errors += 1
 
-    removed = 0
-    for filename in set(previous) - set(desired):
-        path = target / filename
-        try:
-            if path.is_file():
-                path.unlink()
-                removed += 1
-        except OSError:
-            errors += 1
+    tracked = dict(previous)
+    tracked.update(desired)
 
     try:
         manifest_path.write_text(
-            json.dumps({"version": 1, "files": desired}, indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                {"version": 2, "files": tracked, "delivered": sorted(managed)},
+                indent=2,
+                sort_keys=True,
+            ) + "\n",
             encoding="utf-8",
         )
     except OSError:
@@ -102,7 +118,8 @@ def sync_ready_resumes(conn, download_dir: Path | None = None) -> dict[str, int 
     return {
         "ready": len(desired),
         "copied": copied,
-        "removed": removed,
+        "suppressed": suppressed,
+        "removed": 0,
         "missing": missing,
         "errors": errors,
         "directory": str(target),
