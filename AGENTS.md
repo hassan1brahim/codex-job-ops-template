@@ -58,13 +58,19 @@ System-owned files can be edited when improving the workspace:
 - Prefer local files over external services.
 - Use `tools/jd_fetcher` for deterministic JD fetches before browser/web fallbacks.
 - Use Codex reasoning for fit, tailoring, and story selection. Do not rely on keyword-overlap as the decision engine.
-- For every tailored resume, follow `modes/resume.md`. Select exactly 15 JD keywords, ground each
-  one in `profile/master.md` or `cv.md`, and list them as numbered comments in the generated LaTeX.
+- For every tailored resume, follow `modes/resume.md`. Select 6-12 JD keywords, ground each one in
+  `profile/master.md`, and list them as numbered comments with their source; list unsupported JD
+  requirements as `% GAP:` lines instead of forcing them in.
+- Before tailoring, run `python scripts/jobops.py match jds/<jd>.md`; an 80%+ match means use that
+  starter from `profile/starter-resumes/` as-is.
+- Write each resume individually from its JD and `profile/master.md`. Never build a script or
+  template that stamps the same bullets into several resumes.
 - Rewrite extended experience and project descriptions to mirror the JD while preserving the
   substance of what the user actually did. If the evidence bank cannot support a desired keyword or
   impact claim, stop and ask the user for the missing facts before drafting that claim.
 - A resume is not complete until `python scripts/jobops.py check-resume <file.tex>` passes: exactly
-  one page, all 15 keywords visible in extracted text, ATS-readable output, and sufficient page fill.
+  one page, every keyword shown in Experience/Projects (not only Skills), no keyword-dump lines or
+  bolded phrases in bullets, ATS-readable output, and sufficient page fill.
 - Keep evidence concrete: cite exact CV/profile facts, project names, metrics, and JD requirements.
 - Strongly discourage low-fit applications.
 - Stop before external submission, sending messages, or clicking final apply.

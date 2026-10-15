@@ -62,6 +62,7 @@ python scripts/jobops.py add-url "<job-url>"
 python scripts/jobops.py fetch "<job-url>"
 python scripts/jobops.py tracker
 python scripts/jobops.py check-resume output/Your_Name_Role_Resume.tex
+python scripts/jobops.py match jds/<jd>.md   # >= 80% -> send that starter resume as-is
 
 # Job board (discovery)
 python scripts/jobboard.py refresh

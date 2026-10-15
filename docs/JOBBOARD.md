@@ -19,7 +19,7 @@ python scripts/jobboard.py set-status <key> APPLIED
 python scripts/jobboard.py analytics
 ```
 
-Install hourly discovery (including a capped two-page LinkedIn pass) plus deeper description,
+Install hourly discovery (including a fast LinkedIn sweep of the last 24 hours) plus deeper description,
 URL-check, and Codex processing runs at 08:30 and 17:30:
 
 ```bash
@@ -73,16 +73,17 @@ A role listed in several cities is ranked by its **best** configured location.
 |---|---|---|
 | **Simplify / Pitt CSC** | Working | `listings.json` from the GitHub repos. ~34k rows, ~4k live. Carries category, terms and sponsorship. This is the backbone. |
 | **vanshb03** | Working | Same JSON shape, independent contributor pool. Adds roles Simplify misses. |
-| **LinkedIn** | Working | Public guest endpoint, no login. Also the only source with a reliable full-text description endpoint. Runs hourly with a two-page cap and request throttling. |
-| **Direct ATS** | Working | Learns Greenhouse, Lever, and Ashby board IDs from known URLs, then polls the companies directly. Full descriptions arrive inline for Greenhouse/Ashby/Lever. |
+| **LinkedIn** | Working | Public guest endpoint, no login, 10 cards a page. `--linkedin-mode fast` (hourly): broad intern/internship/co-op searches over NJ, NY and the US, last 24h, newest first. `deep` (daily): adds 15 role searches over the last week without LinkedIn's internship facet, because many internships are filed as Entry level; the title filter keeps only internships. A LinkedIn sighting never overwrites a row another feed owns, and LinkedIn rows expire after 7 days unseen rather than on one missed run. |
+| **Direct ATS** | Working | Learns Greenhouse, Lever, Ashby, Workday, and SmartRecruiters board IDs from known U.S. job URLs, then polls the companies directly. All feeds run hourly. Full descriptions arrive inline for Greenhouse/Ashby/Lever. |
+| **Y Combinator** | Working | Parses the structured `data-page` payload on YC's public internships page. HTTP rejection, missing/schema-changed data, or a zero-row payload records the source as blocked. |
 | **Wellfound** | Blocked | Cloudflare Turnstile on every request. Needs a real browser session. |
-| **swelist** | Blocked | Next.js app with no API route and no data in the RSC payload. Needs Playwright, and it aggregates the same GitHub feeds we already read. |
-| **Y Combinator** | Blocked | `workatastartup.com/jobs` returns 406 without a session; the public board's Algolia keys are buried in JS bundles. |
+| **swelist** | Omitted | Its internship CLI reads an older Simplify repository; current Simplify cycles are already ingested directly. |
 
-The blocked three are recorded as blocked rather than silently returning nothing, so
-`jobboard status` always shows real coverage. Turning any of them on means adding a Playwright
-fetcher; note that a previous Playwright batch job on this machine leaked orphaned Chrome renderers
-to ~24 GB RAM, so validate teardown on a small wave first.
+Blocked or structurally changed sources are recorded as blocked rather than silently returning
+nothing, so `jobboard status` and the dashboard show real coverage. YC deliberately treats an HTTP
+rejection, a missing/invalid embedded payload, or zero upstream rows as a source failure. A valid
+page with rows that do not match the configured seasons or disciplines is reported as empty rather
+than blocked.
 
 ## Filtering
 
@@ -100,11 +101,9 @@ Tune the rules in `scripts/board/filters.py`.
 ## Automation and workflow
 
 `autoqueue` appends the best new roles to `data/pipeline.md` and moves them to `EVALUATING`.
-The hourly job runs at most one isolated Codex evaluation/resume worker for roles discovered in the
-last two hours. The scheduled daily job processes one best remaining queued role, so older strong
-jobs are not abandoned.
-That command requires explicit work authorization in the private `config/profile.yml`. It never
-submits an application.
+Scheduled jobs stop after discovery, ranking, queueing, rendering, and notification. They do not
+invoke Codex evaluation or generate resumes. Evaluation and resume work happens only when the user
+explicitly requests it, and it never submits an application.
 
 Workflow statuses are `NEW`, `EVALUATING`, `RESUME_GENERATING`, `READY_TO_APPLY`, `APPLIED`, `OA`,
 `INTERVIEW`, `OFFER`, `REJECTED`, and `WITHDRAWN`. Serve the board locally to change them from each
@@ -150,7 +149,15 @@ saved by the existing workflow. Expect roughly 85% success: some career pages ar
 - **Descriptions are never overwritten** by a refresh, so re-running refresh is cheap and safe.
 - Dedupe uses normalized company/title values, aliases, ATS requisition IDs, and direct ATS URLs.
   Add genuine trade-name aliases to `COMPANY_ALIASES` in `store.py` as they appear.
-- **LinkedIn will 429.** The source stops early and records it in the note rather than failing the
-  run. If `jobboard status` shows LinkedIn kept 0 with "stopped early", wait a few hours.
+- **LinkedIn will 429.** Each request waits out a 429 twice (20s, then 60s) before the source stops
+  early and records it in the note rather than failing the run. If `jobboard status` shows LinkedIn kept 0 with "stopped early", wait a few hours.
 - **Notifications need permission once.** macOS asks the first time; if it is denied, `osascript`
   fails silently forever after.
+
+## Relevance filter notes
+
+- Feeds without a category (LinkedIn, company ATS boards, vansh) must carry a software/data/AI word in
+  the title (`TECH_TITLE` in `scripts/board/filters.py`); "Engineering Intern" alone is usually
+  structural, process or mining work.
+- Every refresh retires untouched `NEW` rows that the current filter rejects (`FILTERED_OUT`), so a
+  filter fix applies to old rows too. Saved rows and anything past `NEW` are never touched.
