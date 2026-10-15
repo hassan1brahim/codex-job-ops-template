@@ -1,105 +1,143 @@
 # Mode: Tailor Resume
 
 This is the authoritative system prompt for creating or rewriting a resume for one job description.
-The objective is a truthful, ATS-readable, information-dense one-page resume—not a generic summary
-and not keyword stuffing.
+The objective is a truthful, ATS-readable, information-dense one-page resume that reads as if the user
+wrote it for this employer: not a generic summary, and not keyword stuffing.
 
 ## Required Inputs
 
 Read, in this order:
 
 1. The complete job description in `jds/` or supplied by the user.
-2. `profile/master.md` as the extended experience and project-description evidence bank.
-3. `cv.md` as the proof-preserving baseline.
-4. `profile/resume-variants.md` for approved shorter versions and inclusion invariants.
-5. The matching evaluation in `reports/`, when present.
+2. `profile/master.md`: the full description of every project and role. This is the ONLY source
+   of bullet content.
+3. `profile/resume-variants.md` for the selection rules.
+4. The matching evaluation in `reports/`, when present.
+
+Never use a `master.md` line tagged `[confirm]`; it is unverified. If it would strengthen this
+resume, ask the user about it and leave it out until they answer.
+
+`cv.md` is a reference layout, not a bullet source. Existing generated resumes in `output/` are never
+a source of truth or of wording.
 
 Never infer a technology, responsibility, result, team size, user count, or metric merely because it
-appears in the JD. Existing generated resumes are not sources of truth.
+appears in the JD.
 
-## 1. Extract Exactly 15 Keywords
+## 0. Try a Starter Resume First
 
-Identify exactly 15 phrases from the JD. Prefer, in order:
+`profile/starter-resumes/` holds your hand-written, validated starter resumes, one per role family
+(for example Full Stack, ML / Data Science, AI Agents, Systems / C++). It is private and ignored by Git. Save the JD, then run:
 
-1. Required technical skills and named technologies.
-2. Core responsibilities and domain concepts.
-3. Engineering practices, collaboration requirements, and outcome language.
-
-Use the employer's exact wording when it remains natural and accurate. Consolidate synonyms rather
-than choosing several versions of the same concept. Do not select boilerplate such as “hard worker.”
-
-Build an internal evidence matrix with: keyword, exact JD context, profile/CV evidence, destination
-bullet or skills line, and support level. Every selected keyword must have direct evidence.
-
-If a high-value keyword appears relevant but the evidence bank does not establish it, ask the user a
-short, specific question about what he built, the tools used, scope, collaborators, and measurable
-result. Update `profile/master.md` only after he confirms the facts. Do not draft the unsupported
-claim while waiting.
-
-## 2. Rewrite From Extended Evidence
-
-Select the experiences and projects that best prove the 15 keywords while obeying the invariants in
-`profile/resume-variants.md`. Rewrite their descriptions; do not merely paste the master bullets.
-
-Each bullet should normally contain:
-
-- the problem, goal, or operating context;
-- the action the user personally took, beginning with a strong verb;
-- the relevant method or technology;
-- a verified result, scale, or quality signal when one exists.
-
-Use PAR/STAR logic without turning bullets into mini-essays. Preserve the essence and causal meaning
-of the source evidence. A keyword belongs in Experience or Projects when it describes demonstrated
-work; Skills may reinforce it but must not be the only evidence for a substantive capability.
-
-Order content by value to this employer, not by keyword count. Remove generic duties, filler,
-objectives, self-ratings, soft-skill lists, and unverified trend terms. Use standard section names:
-Education, Experience, Projects, and Technical Skills.
-
-## 3. LaTeX Keyword Contract
-
-Every generated `.tex` file must include this block before `\documentclass`, filled with the exact
-15 selected phrases:
-
-```tex
-% ATS KEYWORDS USED (15)
-% KW-01: first exact job-description phrase
-% KW-02: second exact job-description phrase
-% ...
-% KW-15: fifteenth exact job-description phrase
+```bash
+python scripts/jobops.py match jds/<jd>.md
 ```
 
-The comments are an audit trail, not a hiding place. Every phrase must also occur naturally in the
-visible, PDF-extracted resume text. Keywords must be unique, numbered `KW-01` through `KW-15`, and
-must not contain invented claims.
+It scores every starter by weighted hard-skill coverage (the Jobscan method: skills the JD repeats
+count more). If the verdict is `USE <starter>` (80% or higher, with at least 4 hard skills detected),
+copy that starter to `output/` with the company naming and stop: no rewrite. Otherwise tailor a new
+resume below, starting from the closest starter rather than a blank page.
 
-## 4. One-Page Maximum-Information Loop
+## One Resume Per JD (no generators)
+
+Write each resume individually from its JD and `master.md`. Never write a script, template function,
+or "variant" block that stamps the same bullets into several resumes. When the user asks for several
+resumes at once, still read each JD in full and write each resume on its own.
+
+Two resumes for different employers should differ wherever the employers' priorities differ: which
+projects are included, which bullet leads each section, and which details each bullet keeps.
+
+## 1. Read the JD's Priorities
+
+Before choosing keywords, write down (internally) the JD's top 3 priorities: what this team most needs
+the intern to do. The first bullet of each experience and the first project must speak to these.
+
+## 2. Pick 6-12 Keywords You Can Prove
+
+Choose 6 to 12 exact JD phrases, preferring named technologies and core responsibilities. Each one
+needs direct evidence in `master.md`. Never pick soft skills or boilerplate ("problem-solving",
+"collaborate with others", "fast-moving environment", "continuous learning"): show those through
+results instead of naming them.
+
+For every JD requirement that matters but has no evidence, write a `% GAP:` line. Do not put it in the
+resume. If a gap looks like something the user may have done but `master.md` does not record, ask them
+a short, specific question; add it to `master.md` only after he confirms.
+
+Fewer, better-placed keywords beat a full list. If a phrase cannot be placed naturally in a true
+sentence, it is a gap, not a keyword.
+
+## 3. Write the Bullets From master.md
+
+Select the roles and projects that best prove the JD's priorities, following
+`profile/resume-variants.md`. For each, pick the 1-4 strongest facts for THIS role from its
+`master.md` entry and write fresh bullets. Do not paste master bullets verbatim.
+
+Write every bullet as STAR compressed into one line (Google's XYZ form: accomplished X, measured by
+Y, by doing Z):
+
+- **Situation/Task:** the context or goal, in a few words;
+- **Action:** what the user personally did, starting with a strong verb, naming the method or tool;
+- **Result:** a measured outcome from `master.md`. Bold it: `\textbf{from 2.48s to 0.33s}`.
+
+Prefer before-and-after numbers over single numbers. Almost every bullet should carry a figure; a
+bullet with none must earn its place another way (a hard technical problem, ownership, security).
+
+What each role's recruiters scan for:
+
+| Role | Lead with |
+|---|---|
+| Backend | latency, throughput, storage/memory, reliability, data scale, ownership of production |
+| Frontend | Core Web Vitals (LCP/INP/CLS), bundle size, accessibility, users, engagement |
+| Full stack | end-to-end ownership plus one strong number from each side |
+| ML | data scale, accuracy/precision/F1 vs a baseline, models in production |
+| AI/Agents | production LLM use, RAG, tools, evaluation harnesses, latency and cost |
+| Python | pipelines, data volume, automation, testing |
+
+Rules:
+
+- Use the employer's wording only where it is true and reads naturally.
+- Inside bullets, bold only measured results; the checker rejects bold text with no figure (digits
+  or "zero"), so a bolded JD keyword fails.
+- Always include the leadership entry `profile/resume-variants.md` names as required.
+- No keyword list in Technical Skills (no "Role-aligned evidence", "Relevant keywords", etc.). Skills
+  lists tools the user has used, grouped by category.
+- Never describe a solo project as a team effort, or a team project as solo; state team size.
+- Order content by value to this employer, not by keyword count.
+
+## 4. LaTeX Keyword Block
+
+Every generated `.tex` file starts with this block before `\documentclass`:
+
+```tex
+% KW-01: exact JD phrase | master.md section that proves it
+% KW-02: exact JD phrase | master.md section
+% ...
+% GAP: JD requirement with no evidence
+```
+
+The checker requires 6-12 numbered keywords, each with a source after `|`, and each visible in the
+Education, Experience, or Projects text. A keyword that appears only under Technical Skills fails.
+
+## 5. One-Page Maximum-Information Loop
 
 Use `templates/resume.tex` as the layout baseline. Keep body text at least 10 pt and margins at least
-0.40 inches. Do not solve overflow by making the document unreadable.
-
-Pack the page empirically:
+0.40 inches.
 
 1. Draft the strongest supported content first.
 2. Compile and validate with `python scripts/jobops.py check-resume <resume.tex>`.
-3. While it remains one page and below the fill threshold, add the next-most-relevant supported proof
-   point or restore useful detail. Recompile after every meaningful addition.
-4. Continue until the first two-page overflow. This proves the content boundary instead of guessing.
-5. Remove, merge, or tighten the lowest-value line that caused overflow; never delete stronger proof
-   merely to retain a weaker keyword mention.
-6. Recompile until the validator passes at exactly one dense page.
+3. While it is one page and below the fill threshold, add the next-most-relevant fact from
+   `master.md`. Recompile after each addition.
+4. Continue until the first two-page overflow, then remove or tighten the lowest-value line.
+5. Recompile until the checker passes at exactly one dense page.
 
-The final page should be filled with evidence, not whitespace or inflated prose. Favor additional
-verified accomplishments over larger spacing.
+The checker requires at least 95% page fill (the physical maximum with these margins is about
+96.4%). Fill the page with evidence, not padding.
 
-## 5. Required Validation and Handoff
-
-Run:
+## 6. Validation and Handoff
 
 ```bash
 python scripts/jobops.py check-resume output/<resume>.tex
 ```
 
 Do not call a resume complete unless the command passes. Report the page count, fill percentage,
-extractable word count, and the 15 validated keywords. Save both `.tex` and `.pdf` under `output/`.
-The user reviews the result; never submit it automatically.
+the keywords, and the gaps. Save `.tex` and `.pdf` under `output/`. The user reviews the result; never
+submit it automatically.

@@ -12,7 +12,18 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-KEYWORD_RE = re.compile(r"^\s*%\s*KW-(\d{2}):\s*(.+?)\s*$", re.MULTILINE)
+KEYWORD_RE = re.compile(r"^\s*%\s*KW-(\d{2}):\s*(.*?)\s*$", re.MULTILINE)
+GAP_RE = re.compile(r"^\s*%\s*GAP:\s*(.+?)\s*$", re.MULTILINE)
+MIN_KEYWORDS = 6
+MAX_KEYWORDS = 12
+# Labels that turn the Skills section into a pasted list of JD phrases.
+BANNED_LABELS = ("role-aligned", "relevant keywords", "jd keywords", "ats keywords", "keywords:")
+ITEM_LINE_RE = re.compile(r"^\s*\\item\b.*$", re.MULTILINE)
+BOLD_RE = re.compile(r"\\textbf\{([^{}]*)\}")
+DEFAULT_MIN_FILL = 0.95
+# A word broken at a line end: "Type-" then "Script" on the next line.
+HYPHEN_BREAK_RE = re.compile(r"([A-Za-z]{2,})-\n\s*([a-zA-Z]{2,})")
+SKILLS_HEADING_RE = re.compile(r"\btechnical skills\b|\bskills\b", re.IGNORECASE)
 PAGE_RE = re.compile(r"^Pages:\s+(\d+)\s*$", re.MULTILINE)
 PAGE_BOX_RE = re.compile(r'<page\s+width="([\d.]+)"\s+height="([\d.]+)">')
 WORD_BOX_RE = re.compile(r'<word\s+[^>]*yMax="([\d.]+)"[^>]*>')
@@ -25,6 +36,7 @@ class ResumeMetrics:
     fill_ratio: float
     words: int
     keywords: tuple[str, ...]
+    gaps: tuple[str, ...] = ()
 
 
 class ResumeCheckError(RuntimeError):
@@ -45,22 +57,63 @@ def _run(command: list[str], *, cwd: Path | None = None) -> str:
     return result.stdout
 
 
-def parse_keywords(source: str) -> tuple[str, ...]:
+def parse_keywords(source: str) -> tuple[tuple[str, str], ...]:
+    """Return (phrase, evidence) pairs from `% KW-NN: phrase | evidence` comments."""
     matches = KEYWORD_RE.findall(source)
-    expected = [f"{number:02d}" for number in range(1, 16)]
-    numbers = [number for number, _ in matches]
-    if numbers != expected:
+    if not MIN_KEYWORDS <= len(matches) <= MAX_KEYWORDS:
         raise ResumeCheckError(
-            "Expected exactly one ordered keyword comment for KW-01 through KW-15."
+            f"Expected {MIN_KEYWORDS}-{MAX_KEYWORDS} keyword comments, found {len(matches)}. "
+            "Pick only JD phrases with real evidence; list the rest as % GAP: lines."
         )
+    numbers = [number for number, _ in matches]
+    if numbers != [f"{n:02d}" for n in range(1, len(matches) + 1)]:
+        raise ResumeCheckError("Keyword comments must be numbered KW-01, KW-02, ... in order.")
 
-    keywords = tuple(keyword.strip() for _, keyword in matches)
-    if any(not keyword or keyword.upper() == "REPLACE ME" for keyword in keywords):
-        raise ResumeCheckError("All 15 keyword placeholders must be replaced.")
-    normalized = [keyword.casefold() for keyword in keywords]
-    if len(set(normalized)) != 15:
-        raise ResumeCheckError("The 15 keyword phrases must be unique.")
-    return keywords
+    pairs: list[tuple[str, str]] = []
+    for number, body in matches:
+        phrase, _, evidence = body.partition("|")
+        phrase, evidence = phrase.strip(), evidence.strip()
+        if not phrase or phrase.upper() == "REPLACE ME":
+            raise ResumeCheckError(f"KW-{number} has no phrase.")
+        if not evidence:
+            raise ResumeCheckError(
+                f"KW-{number} ({phrase}) names no evidence; use `% KW-{number}: phrase | master.md section`."
+            )
+        pairs.append((phrase, evidence))
+    normalized = [phrase.casefold() for phrase, _ in pairs]
+    if len(set(normalized)) != len(normalized):
+        raise ResumeCheckError("Keyword phrases must be unique.")
+    return tuple(pairs)
+
+
+def parse_gaps(source: str) -> tuple[str, ...]:
+    return tuple(gap for gap in GAP_RE.findall(source) if gap)
+
+
+def lint_source(source: str) -> list[str]:
+    """Catch keyword stuffing that a page/keyword count cannot see."""
+    body = "\n".join(line for line in source.splitlines() if not line.lstrip().startswith("%"))
+    errors: list[str] = []
+    lowered = body.casefold()
+    for label in BANNED_LABELS:
+        if label in lowered:
+            errors.append(f"remove the '{label}' line; JD phrases belong in bullets, not a pasted list")
+    for line in ITEM_LINE_RE.findall(body):
+        for bolded in BOLD_RE.findall(line):
+            if not re.search(r"\d|\bzero\b", bolded, re.IGNORECASE):
+                errors.append(
+                    f"bold only measured results in bullets; '{bolded}' has no figure"
+                )
+    return errors
+
+
+def _text_above_skills(extracted: str) -> str:
+    """Visible text before the Skills heading, where keywords must be demonstrated."""
+    lines = extracted.splitlines()
+    for index, line in enumerate(lines):
+        if SKILLS_HEADING_RE.fullmatch(line.strip()):
+            return "\n".join(lines[:index])
+    raise ResumeCheckError("Could not find a 'Technical Skills' heading in the PDF text.")
 
 
 def _normalize_text(value: str) -> str:
@@ -68,7 +121,11 @@ def _normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value).strip()
 
 
-def _compile(tex_path: Path, output_pdf: Path) -> Path:
+OVERFULL_RE = re.compile(r"^Overfull \\hbox \(([\d.]+)pt too wide\)", re.MULTILINE)
+
+
+def _compile(tex_path: Path, output_pdf: Path) -> tuple[Path, list[float]]:
+    """Compile to `output_pdf`; also return how far (pt) each overfull line sticks past the margin."""
     compiler = shutil.which("tectonic")
     if not compiler:
         raise ResumeCheckError("tectonic is required to compile and validate LaTeX resumes.")
@@ -82,16 +139,18 @@ def _compile(tex_path: Path, output_pdf: Path) -> Path:
         compiled = temp_dir / tex_path.with_suffix(".pdf").name
         if not compiled.exists():
             raise ResumeCheckError("tectonic completed without producing a PDF.")
+        log = temp_dir / tex_path.with_suffix(".log").name
+        overfull = [float(x) for x in OVERFULL_RE.findall(log.read_text(errors="ignore"))] if log.exists() else []
         output_pdf.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(compiled, output_pdf)
-    return output_pdf
+    return output_pdf, overfull
 
 
 def validate_resume(
     tex_path: Path,
     *,
     output_pdf: Path | None = None,
-    min_fill: float = 0.88,
+    min_fill: float = DEFAULT_MIN_FILL,
 ) -> ResumeMetrics:
     tex_path = tex_path.resolve()
     if not tex_path.is_file():
@@ -102,9 +161,19 @@ def validate_resume(
         raise ResumeCheckError("--min-fill must be between 0 and 1.")
 
     source = tex_path.read_text(encoding="utf-8")
-    keywords = parse_keywords(source)
+    pairs = parse_keywords(source)
+    keywords = tuple(phrase for phrase, _ in pairs)
+    lint_errors = lint_source(source)
+    if lint_errors:
+        raise ResumeCheckError("; ".join(lint_errors))
     pdf_path = (output_pdf or tex_path.with_suffix(".pdf")).resolve()
-    _compile(tex_path, pdf_path)
+    _, overfull = _compile(tex_path, pdf_path)
+    visible = [width for width in overfull if width > 1.0]
+    if visible:
+        raise ResumeCheckError(
+            f"{len(visible)} line(s) run past the right margin (up to {max(visible):.1f}pt); "
+            "reword them or raise \\emergencystretch"
+        )
 
     info = _run(["pdfinfo", str(pdf_path)])
     page_match = PAGE_RE.search(info)
@@ -113,7 +182,13 @@ def validate_resume(
     pages = int(page_match.group(1))
 
     extracted = _run(["pdftotext", "-layout", str(pdf_path), "-"])
-    normalized_text = _normalize_text(extracted)
+    split = HYPHEN_BREAK_RE.findall(extracted)
+    if split:
+        raise ResumeCheckError(
+            "words are hyphenated across lines, which an ATS reads as two words: "
+            + ", ".join(f"{a}-{b}" for a, b in split[:5])
+        )
+    demonstrated_text = _normalize_text(_text_above_skills(extracted))
     words = len(re.findall(r"\b[\w+#./-]+\b", extracted))
     if words < 150:
         raise ResumeCheckError(
@@ -121,13 +196,12 @@ def validate_resume(
         )
 
     missing = [
-        keyword for keyword in keywords if _normalize_text(keyword) not in normalized_text
+        keyword for keyword in keywords if _normalize_text(keyword) not in demonstrated_text
     ]
     if missing:
-        rendered = ", ".join(missing)
         raise ResumeCheckError(
-            "Keyword comments are not enough; these phrases are missing from visible PDF text: "
-            + rendered
+            "These keywords appear only in Skills or nowhere; show them in a bullet or project line: "
+            + ", ".join(missing)
         )
 
     bbox = _run(["pdftotext", "-bbox", str(pdf_path), "-"])
@@ -148,7 +222,7 @@ def validate_resume(
     if errors:
         raise ResumeCheckError("; ".join(errors))
 
-    return ResumeMetrics(pdf_path, pages, fill_ratio, words, keywords)
+    return ResumeMetrics(pdf_path, pages, fill_ratio, words, keywords, parse_gaps(source))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -164,8 +238,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-fill",
         type=float,
-        default=0.88,
-        help="Minimum bottom-most text position as a fraction of page height (default: 0.88).",
+        default=DEFAULT_MIN_FILL,
+        help="Minimum bottom-most text position as a fraction of page height (default: 0.95).",
     )
     return parser
 
@@ -190,6 +264,10 @@ def main(argv: list[str] | None = None) -> int:
     print("Keywords:")
     for index, keyword in enumerate(metrics.keywords, start=1):
         print(f"  {index:02d}. {keyword}")
+    if metrics.gaps:
+        print("Gaps (JD asks, no evidence):")
+        for gap in metrics.gaps:
+            print(f"  - {gap}")
     return 0
 
 

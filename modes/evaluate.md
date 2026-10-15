@@ -29,8 +29,8 @@ Create a report with:
 1. **Role Summary**: company, title, location, seniority, remote/onsite, internship/full-time.
 2. **Score**: `0.0-5.0`, with one-line recommendation.
 3. **Match Table**: JD requirement, user evidence, strength, gap.
-4. **Keyword Evidence Matrix**: exactly 15 high-value JD phrases, each mapped to a concrete fact in
-   `profile/master.md` or `cv.md`; label unsupported phrases as gaps rather than forcing them in.
+4. **Keyword Evidence Matrix**: the 6-12 highest-value JD phrases the user can prove, each mapped to a
+   concrete fact in `profile/master.md`; list every unsupported requirement as a gap.
 5. **Resume Tailoring Plan**: experiences/projects to emphasize, proof points to use, and material to
    cut. Follow `modes/resume.md` when generating the resume.
 6. **Application Answers**: only if score is `4.5+`, draft common answers.
