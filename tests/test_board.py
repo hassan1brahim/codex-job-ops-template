@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.board.filters import BoardConfig, keep_job
 from scripts.board.scoring import freshness_score, location_score, score_job
@@ -12,10 +13,11 @@ from scripts.board.render import render
 from scripts.board.sources.ats import _plain, _timestamp, discover_boards
 from scripts.board.sources.linkedin import _parse_cards
 from scripts.board.sources.vansh import REPOS as VANSH_REPOS
+from scripts.board.sources.yc import _payload as parse_yc_payload, fetch as fetch_yc
 from scripts.board.store import (Job, applied_at_map, classify_run, connect, dedupe_key,
                                  delete_recruiter, request_resume, resume_requests,
                                  latest_runs, mark_inactive_missing_ats, mark_seen, record_run,
-                                 recruiters_for, save_recruiter, set_saved, set_status,
+                                 recruiters_for, save_artifacts, save_recruiter, set_saved, set_status,
                                  sources_for, upsert)
 
 
@@ -46,6 +48,35 @@ class ScoringTests(unittest.TestCase):
         self.assertTrue(any("Skills" in reason for reason in result.reasons))
 
 
+class YCombinatorSourceTests(unittest.TestCase):
+    PAGE = """<html><body><div data-page="{&quot;props&quot;:{&quot;season&quot;:&quot;N/A&quot;,&quot;jobPostings&quot;:[{&quot;id&quot;:42,&quot;title&quot;:&quot;Software Engineer Intern&quot;,&quot;url&quot;:&quot;/companies/acme/jobs/abc-intern&quot;,&quot;location&quot;:&quot;New York, NY, US&quot;,&quot;prettyRole&quot;:&quot;Engineering&quot;,&quot;companyName&quot;:&quot;Acme&quot;,&quot;visa&quot;:&quot;US citizen/visa only&quot;}]}}"></div></body></html>"""
+
+    def test_parses_public_data_page(self):
+        props = parse_yc_payload(self.PAGE)
+        self.assertEqual(props["jobPostings"][0]["companyName"], "Acme")
+
+    def test_successful_fetch_returns_jobs(self):
+        with patch("scripts.board.sources.yc._get", return_value=self.PAGE):
+            result = fetch_yc(BoardConfig())
+        self.assertTrue(result.ok)
+        self.assertEqual(result.fetched, 1)
+        self.assertEqual(len(result.jobs), 1)
+        self.assertEqual(result.jobs[0].source, "yc")
+
+    def test_missing_payload_is_reported_blocked(self):
+        with patch("scripts.board.sources.yc._get", return_value="<html></html>"):
+            result = fetch_yc(BoardConfig())
+        self.assertFalse(result.ok)
+        self.assertIn("payload missing", result.note)
+
+    def test_zero_upstream_rows_is_reported_blocked(self):
+        page = '<div data-page="{&quot;props&quot;:{&quot;jobPostings&quot;:[]}}"></div>'
+        with patch("scripts.board.sources.yc._get", return_value=page):
+            result = fetch_yc(BoardConfig())
+        self.assertFalse(result.ok)
+        self.assertIn("zero postings", result.note)
+
+
 class StoreTests(unittest.TestCase):
     def test_alias_dedupe(self):
         a = dedupe_key("Campbell Soup Company", "Software Engineer Intern", "a")
@@ -66,7 +97,7 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT status FROM jobs").fetchone()[0], "READY_TO_APPLY")
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM job_events").fetchone()[0], 1)
 
-    def test_ready_resume_download_sync_and_applied_removal(self):
+    def test_ready_resume_download_sync_is_add_only_after_applied(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             conn = connect(root / "board.db")
@@ -90,8 +121,69 @@ class StoreTests(unittest.TestCase):
 
             set_status(conn, row["key"], "APPLIED")
             result = sync_ready_resumes(conn, downloads)
-            self.assertEqual(result["removed"], 1)
+            self.assertEqual(result["removed"], 0)
+            self.assertTrue(copied.exists())
+
+    def test_ready_resume_download_sync_respects_user_deletion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            conn = connect(root / "board.db")
+            job = Job(source="test", company="Example", title="Software Engineer Intern",
+                      url="https://jobs.lever.co/example/abc", locations=["New York, NY"],
+                      tier=1, distance_mi=31, place_label="New York, NY")
+            upsert(conn, [job])
+            row = conn.execute("SELECT * FROM jobs").fetchone()
+            resume = root / "Example_Resume.pdf"
+            resume.write_bytes(b"%PDF-test")
+            conn.execute(
+                "UPDATE jobs SET status='READY_TO_APPLY',resume_pdf_path=? WHERE key=?",
+                (str(resume), row["key"]),
+            )
+            conn.commit()
+            downloads = root / "downloads"
+
+            first = sync_ready_resumes(conn, downloads)
+            copied = downloads / "Example_Software_Engineer_Intern_Your_Name_Resume.pdf"
+            self.assertEqual(first["copied"], 1)
+            copied.unlink()
+
+            second = sync_ready_resumes(conn, downloads)
+            self.assertEqual(second["copied"], 0)
+            self.assertEqual(second["suppressed"], 1)
             self.assertFalse(copied.exists())
+
+            third = sync_ready_resumes(conn, downloads)
+            self.assertEqual(third["suppressed"], 1)
+            self.assertFalse(copied.exists())
+
+    def test_ready_resume_download_sync_retries_a_copy_that_never_succeeded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            conn = connect(root / "board.db")
+            job = Job(source="test", company="Example", title="Software Engineer Intern",
+                      url="https://jobs.lever.co/example/abc", locations=["New York, NY"],
+                      tier=1, distance_mi=31, place_label="New York, NY")
+            upsert(conn, [job])
+            row = conn.execute("SELECT * FROM jobs").fetchone()
+            resume = root / "Example_Resume.pdf"
+            resume.write_bytes(b"%PDF-test")
+            conn.execute(
+                "UPDATE jobs SET status='READY_TO_APPLY',resume_pdf_path=? WHERE key=?",
+                (str(resume), row["key"]),
+            )
+            conn.commit()
+            downloads = root / "downloads"
+
+            with patch("scripts.board.resume_downloads.shutil.copy2", side_effect=OSError):
+                failed = sync_ready_resumes(conn, downloads)
+            self.assertEqual(failed["errors"], 1)
+            self.assertEqual(failed["suppressed"], 0)
+
+            retried = sync_ready_resumes(conn, downloads)
+            copied = downloads / "Example_Software_Engineer_Intern_Your_Name_Resume.pdf"
+            self.assertEqual(retried["copied"], 1)
+            self.assertEqual(retried["suppressed"], 0)
+            self.assertTrue(copied.exists())
 
     def test_board_renders_applied_checkbox_control(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -111,6 +203,19 @@ class StoreTests(unittest.TestCase):
             self.assertIn('class="when', html)
             self.assertIn('class="fit"', html)
             self.assertNotIn('<small>priority</small>', html)
+            self.assertIn('id="fReady"', html)
+            self.assertIn('Resume ready', html)
+            self.assertIn('id="scope"', html)
+            self.assertIn('scope.addEventListener("change"', html)
+            self.assertIn('More filters', html)
+            self.assertNotIn('id="tierPills"', html)
+            self.assertIn('id="pageNext"', html)
+            self.assertIn('pageSize:50', html)
+            self.assertIn('matched.slice(state.page*state.pageSize', html)
+            self.assertIn('setTimeout(() => {', html)
+            self.assertIn('/api/description?key=', html)
+            self.assertIn('row.pendingSaved = true', html)
+            self.assertIn('other.pendingStatus = true', html)
 
     def test_direct_feed_marks_only_successful_board_removals(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -141,12 +246,121 @@ class AtsTests(unittest.TestCase):
                 ("One", "https://job-boards.greenhouse.io/one/jobs/12"),
                 ("Two", "https://jobs.lever.co/two/abc/apply"),
                 ("Three", "https://jobs.ashbyhq.com/three/uuid/application"),
+                ("Xcel", "https://xcelenergy.wd1.myworkdayjobs.com/External/job/Denver/Intern_JR1"),
+                ("Brevan", "https://wd3.myworkdaysite.com/recruiting/brevanhoward/BH_ExternalCareers/job/New-York/Intern_JR2"),
+                ("Wellmark", "https://jobs.smartrecruiters.com/WellmarkInc/7440001-intern"),
+                ("Intel", "https://intel.wd1.myworkdayjobs.com/en-us/external/job/Phoenix/Intern_JR3"),
+                ("JPMorgan", "https://jpmc.fa.oraclecloud.com/hcmUI/CandidateExperience/en/sites/CX_1001/job/210799739"),
             ])
             conn.commit(); conn.close()
             boards = discover_boards(path)
             self.assertIn(("greenhouse", "global", "one"), boards)
             self.assertIn(("lever", "global", "two"), boards)
             self.assertIn(("ashby", "global", "three"), boards)
+            self.assertIn(("workday", "us", "xcelenergy.wd1.myworkdayjobs.com|xcelenergy|External"), boards)
+            self.assertIn(("workday", "us", "wd3.myworkdaysite.com|brevanhoward|BH_ExternalCareers"), boards)
+            self.assertIn(("smartrecruiters", "us", "WellmarkInc"), boards)
+            self.assertIn(("workday", "us", "intel.wd1.myworkdayjobs.com|intel|external"), boards)
+            self.assertIn(("oracle", "us", "jpmc.fa.oraclecloud.com|CX_1001"), boards)
+
+    def test_eightfold_country_first_location_is_readable(self):
+        from scripts.board.sources.career_sites import _eightfold_location
+        self.assertEqual(_eightfold_location("United States-California-Manhattan Beach"),
+                         "Manhattan Beach, California")
+        self.assertEqual(_eightfold_location("Sunnyvale, CA"), "Sunnyvale, CA")
+
+    def test_plural_internships_and_full_us_name_are_recognised(self):
+        from scripts.board.filters import INTERN_WORDS
+        from scripts.board.geo import best_place
+        self.assertTrue(INTERN_WORDS.search("Machine Learning and AI Masters Internships"))
+        self.assertLessEqual(best_place(["United States of America"]).tier, 3)
+
+    def test_goldman_division_makes_engineering_summer_analyst_a_tech_role(self):
+        from scripts.board.sources import career_sites
+        payload = {"data": {"roleSearch": {"totalCount": 2, "items": [
+            {"roleId": "1_GS_CAMPUS", "jobTitle": "2027 | Americas | New York | Engineering | Summer Analyst",
+             "jobFunction": None, "locations": [{"city": "New York", "state": "NY", "country": "United States"}]},
+            {"roleId": "2_GS_CAMPUS", "jobTitle": "2027 | Americas | New York | Global Banking | Summer Analyst",
+             "jobFunction": None, "locations": [{"city": "New York", "state": "NY", "country": "United States"}]},
+        ]}}}
+        with patch.object(career_sites, "_json", return_value=payload):
+            jobs = career_sites._goldman("goldman", "Goldman Sachs", "us")
+        kept = [j.title for j in jobs if keep_job(j, BoardConfig())]
+        self.assertEqual(kept, ["2027 | Americas | New York | Engineering | Summer Analyst"])
+
+    def test_board_fetch_retries_transient_errors_but_not_404(self):
+        import urllib.error
+        from scripts.board.sources import ats
+        calls = {"flaky": 0, "gone": 0}
+
+        def flaky(token, company, region):
+            calls[token] += 1
+            if token == "gone":
+                raise urllib.error.HTTPError("u", 404, "Not Found", None, None)
+            if calls[token] < 3:
+                raise urllib.error.URLError("nodename nor servname provided")
+            return []
+
+        boards = {("flaky", "us", "flaky"): "A", ("flaky", "us", "gone"): "B"}
+        with patch.object(ats, "discover_boards", return_value=boards), \
+                patch.object(ats, "load_companies", return_value=[]), \
+                patch.dict(ats.FETCHERS, {"flaky": flaky}), patch.object(ats.time, "sleep"):
+            result = ats._fetch_vendors(BoardConfig(), {"flaky"}, "career_pages")
+        self.assertEqual(calls, {"flaky": 3, "gone": 1})
+        self.assertEqual(result.successful_boards, {("flaky", "flaky")})
+
+    def test_avature_cards_parse_title_link_and_us_location(self):
+        from scripts.board.sources import career_sites
+        page = """<article class="article"><h3><a class="link"
+            href="https://careers.twosigma.com/careers/JobDetail/New-York-SWE-Internship/14100">
+            Software Engineering Internship (Summer 2027) </a></h3>
+            <span class="paragraph_inner-span">United States - NY New York</span></article>"""
+        with patch.object(career_sites, "_request", side_effect=[page, page]):
+            jobs = career_sites._avature("careers.twosigma.com|/careers/OpenRoles", "Two Sigma", "us")
+        self.assertEqual([(j.title, j.locations, j.ats_requisition_id) for j in jobs],
+                         [("Software Engineering Internship (Summer 2027)", ["New York, NY"], "14100")])
+        self.assertTrue(keep_job(jobs[0], BoardConfig()))
+
+    def test_company_list_is_valid(self):
+        from scripts.board.sources.ats import FETCHERS
+        from scripts.board.sources.career_sites import load_companies
+        companies = load_companies()
+        self.assertTrue(companies)
+        for entry in companies:
+            self.assertIn(entry["vendor"], FETCHERS, entry)
+            self.assertTrue(entry["company"] and entry["board"], entry)
+
+    def test_direct_board_discovery_uses_only_us_sightings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "board.db"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE jobs (company TEXT, url TEXT, tier INTEGER)")
+            conn.executemany("INSERT INTO jobs VALUES (?,?,?)", [
+                ("US", "https://us.wd1.myworkdayjobs.com/Careers/job/A/Intern_1", 3),
+                ("Intl", "https://intl.wd1.myworkdayjobs.com/Careers/job/B/Intern_2", 4),
+            ])
+            conn.commit(); conn.close()
+            boards = discover_boards(path)
+            self.assertTrue(any("us.wd1.myworkdayjobs.com" in key[2] for key in boards))
+            self.assertFalse(any("intl.wd1.myworkdayjobs.com" in key[2] for key in boards))
+
+    def test_greenhouse_embed_widget_uses_for_param_not_path(self):
+        """boards.greenhouse.io/embed/job_app is a shared widget path across every
+        tenant; the real board slug rides in ?for=, and a bare numeric ?token= (an
+        older widget shape) identifies a job, not a board, so it can't be learned."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "board.db"
+            conn = sqlite3.connect(path)
+            conn.execute("CREATE TABLE jobs (company TEXT, url TEXT)")
+            conn.executemany("INSERT INTO jobs VALUES (?,?)", [
+                ("Gemini", "https://boards.greenhouse.io/embed/job_app?for=gemini&token=8214272"),
+                ("Jump Trading", "https://boards.greenhouse.io/embed/job_app?token=8052351"),
+            ])
+            conn.commit(); conn.close()
+            boards = discover_boards(path)
+            self.assertIn(("greenhouse", "global", "gemini"), boards)
+            self.assertNotIn(("greenhouse", "global", "embed"), boards)
+            self.assertEqual(len(boards), 1)
 
     def test_linkedin_card_keeps_source_posting_date(self):
         body = '''<li><div class="base-card" data-entity-urn="urn:li:jobPosting:1234567">
@@ -159,6 +373,23 @@ class AtsTests(unittest.TestCase):
         jobs = _parse_cards(body)
         self.assertEqual(len(jobs), 1)
         self.assertEqual(jobs[0].date_posted, 1788998400)
+
+
+class PostedDateTests(unittest.TestCase):
+    """Workday's "Posted Today" is stamped at scan time; rescans must not make it look newer."""
+
+    def test_rescan_never_moves_post_date_past_first_seen(self):
+        job = lambda posted: Job(source="ats", company="KLA", title="Software Engineer Intern - AI",
+                                 url="https://kla.wd1.myworkdayjobs.com/x/job/1", locations=["Remote"],
+                                 tier=1, distance_mi=0, place_label="Remote", date_posted=posted)
+        with tempfile.TemporaryDirectory() as directory:
+            conn = connect(Path(directory) / "board.db")
+            with patch("scripts.board.store.time.time", return_value=1_000):
+                upsert(conn, [job(1_000)])
+            with patch("scripts.board.store.time.time", return_value=5_000):
+                upsert(conn, [job(5_000)])
+            row = conn.execute("SELECT date_posted, first_seen FROM jobs").fetchone()
+            self.assertEqual((row["date_posted"], row["first_seen"]), (1_000, 1_000))
 
 
 class SourceHealthTests(unittest.TestCase):
@@ -346,27 +577,52 @@ class FeedOrderingTests(unittest.TestCase):
             conn = connect(Path(directory) / "board.db")
             posted = Job(source="simplify", company="Dated", title="Software Engineer Intern",
                          url="https://jobs.lever.co/a/1", locations=["New York, NY"], tier=1,
-                         distance_mi=31, place_label="New York, NY", date_posted=1_900_000_000)
+                         distance_mi=31, place_label="New York, NY", date_posted=1_791_000_000)
             undated = Job(source="simplify", company="Undated", title="Software Engineer Intern",
                           url="https://jobs.lever.co/b/2", locations=["New York, NY"], tier=1,
                           distance_mi=31, place_label="New York, NY", date_posted=None)
             upsert(conn, [posted, undated])
             rows = {r["c"]: r for r in _rows_payload(conn)}
-            self.assertEqual(rows["Dated"]["when"], 1_900_000_000)
+            self.assertEqual(rows["Dated"]["when"], 1_791_000_000)
             self.assertTrue(rows["Dated"]["postedKnown"])
             self.assertEqual(rows["Undated"]["when"], rows["Undated"]["discovered"])
             self.assertFalse(rows["Undated"]["postedKnown"],
                              "a missing posting date must not be presented as known")
 
+    def test_hides_pre_october_postings_unless_applied(self):
+        from scripts.board.render import _rows_payload
+        with tempfile.TemporaryDirectory() as directory:
+            conn = connect(Path(directory) / "board.db")
+            old = lambda name: Job(source="simplify", company=name, title="Software Engineer Intern",
+                                   url=f"https://jobs.lever.co/{name}/1", locations=["New York, NY"],
+                                   tier=1, distance_mi=31, place_label="New York, NY",
+                                   date_posted=1_788_000_000)  # 2026-08-29
+            upsert(conn, [old("Skipped"), old("Applied")])
+            key = conn.execute("SELECT key FROM jobs WHERE company='Applied'").fetchone()["key"]
+            set_status(conn, key, "APPLIED")
+            self.assertEqual([r["c"] for r in _rows_payload(conn)], ["Applied"])
+
 
 class FilterTests(unittest.TestCase):
     """A source's own category and the title are both evidence; neither is a veto."""
 
-    def _job(self, title, category=None, terms=None, tier=1):
-        return Job(source="simplify", company="Example", title=title,
+    def _job(self, title, category=None, terms=None, tier=1, source="vansh"):
+        return Job(source=source, company="Example", title=title,
                    url="https://jobs.lever.co/example/abc", locations=["New York, NY"],
                    category=category, terms=terms or [], tier=tier, distance_mi=31,
                    place_label="New York, NY")
+
+    def test_simplify_listings_are_kept_whole(self):
+        """Simplify is hand-curated: hardware and quant interns show, new-grad rows do not."""
+        cfg = BoardConfig()
+        self.assertTrue(keep_job(self._job("Signal Integrity Intern", "Hardware", source="simplify"), cfg))
+        self.assertTrue(keep_job(self._job("Quantitative Investment Intern", "Quant", source="simplify"), cfg))
+        self.assertFalse(keep_job(self._job("Software Engineer, New Grad", "Software", source="simplify"), cfg))
+
+    def test_member_of_technical_staff_is_not_a_staff_role(self):
+        cfg = BoardConfig()
+        self.assertTrue(keep_job(self._job("Frontend Engineer Intern - Member of Technical Staff", "Software"), cfg))
+        self.assertFalse(keep_job(self._job("Staff Software Engineer", "Software"), cfg))
 
     def test_trusted_category_admits_an_unusual_title(self):
         """Simplify tagged Waymo's 'Scenes Intern' Software; the title regex did not."""
@@ -441,6 +697,20 @@ class AppliedTrackingTests(unittest.TestCase):
             self.assertIsNotNone(row["appliedAt"])
             self.assertEqual(row["st"], "APPLIED")
 
+    def test_skip_reason_reaches_the_board_and_is_highlighted(self):
+        from scripts.board.render import _rows_payload
+        with tempfile.TemporaryDirectory() as directory:
+            conn, key = self._setup(directory)
+            reason = "Requires current PhD enrollment."
+            save_artifacts(conn, key, fit_score=20, decision_reason=reason)
+            set_status(conn, key, "WITHDRAWN")
+            self.assertEqual(_rows_payload(conn)[0]["decision"], reason)
+            output = Path(directory) / "board.html"
+            render(conn, output)
+            html = output.read_text()
+            self.assertIn("Do not apply", html)
+            self.assertIn(reason, html)
+
     def test_applied_chip_is_not_vetoed_by_the_active_view(self):
         """The Applied chip returned nothing because View=Active filtered first."""
         with tempfile.TemporaryDirectory() as directory:
@@ -461,7 +731,7 @@ class AppliedTrackingTests(unittest.TestCase):
             render(conn, output)
             html = output.read_text()
             self.assertIn("needsFollowUp", html)
-            self.assertIn('chip("followup","Follow up"', html)
+            self.assertIn('["followup","Follow up"]', html)
             self.assertIn('"APPLIED":"Submitted.', html)
             self.assertIn("Jane", html)
 
@@ -534,9 +804,55 @@ class ResumeRequestTests(unittest.TestCase):
             html = output.read_text()
             self.assertIn("data-tailor=", html)
             self.assertIn("/api/request-resume", html)
-            self.assertIn('chip("tailor","Tailor queue"', html)
+            self.assertIn('["tailor","Tailor queue"]', html)
             self.assertIn('"reqAt":', html)
+
+
+
+class SameTitleTests(unittest.TestCase):
+    """One feed listing one title at several links is several jobs."""
+
+    def _job(self, url, title="Software Engineer Intern", source="simplify"):
+        return Job(source=source, company="Parsons", title=title, url=url,
+                   locations=["Huntsville, AL"], tier=3)
+
+    def test_same_title_different_links_are_separate_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conn = connect(Path(directory) / "board.db")
+            upsert(conn, [self._job("https://p.example/a")])
+            upsert(conn, [self._job("https://p.example/a"), self._job("https://p.example/b?src=x")])
+            urls = sorted(r["url"] for r in conn.execute("SELECT url FROM jobs"))
+            self.assertEqual(urls, ["https://p.example/a", "https://p.example/b?src=x"])
+            # A rescan keeps both rows instead of swapping them.
+            upsert(conn, [self._job("https://p.example/b?src=x"), self._job("https://p.example/a")])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2)
+
+    def test_near_identical_titles_in_one_feed_stay_apart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conn = connect(Path(directory) / "board.db")
+            upsert(conn, [self._job("https://g.example/1", "AI Evaluation & Benchmarking Intern")])
+            upsert(conn, [self._job("https://g.example/2", "AI Evaluation & Benchmarking Intern - AGI")])
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 2)
+
+
+    def test_relisting_at_a_new_link_gets_its_own_date(self):
+        with tempfile.TemporaryDirectory() as directory:
+            conn = connect(Path(directory) / "board.db")
+            old = self._job("https://d.example/old")
+            old.date_posted = 1_788_000_000
+            upsert(conn, [old])
+            new = self._job("https://d.example/new")
+            new.date_posted = 1_792_000_000
+            upsert(conn, [new])
+            self.assertEqual(conn.execute("SELECT date_posted FROM jobs").fetchone()[0], 1_792_000_000)
+
+
+    def test_link_id_keeps_job_ids_in_the_query(self):
+        from scripts.board.store import link_id
+        self.assertNotEqual(link_id("https://d2l.com/jobs/?job_id=1"), link_id("https://d2l.com/jobs/?job_id=2"))
+        self.assertEqual(link_id("https://x.com/j/1?utm_source=a"), link_id("https://x.com/j/1/"))
 
 
 if __name__ == "__main__":
     unittest.main()
+
