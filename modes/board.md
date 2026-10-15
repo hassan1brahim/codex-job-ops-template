@@ -10,7 +10,9 @@ modes already expect, so nothing downstream changes.
 ## What The Board Is
 
 `scripts/jobboard.py` aggregates SWE / AI / Data **internships** from Simplify, the vanshb03
-community mirror, LinkedIn, and direct Greenhouse/Lever/Ashby feeds into `data/board.db`. Jobs are
+community mirror, LinkedIn, Y Combinator, and direct Greenhouse/Lever/Ashby/Workday/
+SmartRecruiters feeds into
+`data/board.db`. Jobs are
 ranked by location (35%), freshness (25%), role relevance (20%), skill evidence (10%), company
 preference (5%), and application friction (5%).
 
@@ -22,8 +24,14 @@ preference (5%), and application friction (5%).
 | 3 | Rest of US, ordered by great-circle miles from home |
 | 4 | International |
 
-Wellfound, swelist and YC are **known blocked**, not missing. `jobboard status` prints why. Never
-report the board as complete coverage of those three.
+Wellfound is **known blocked**, not missing. `jobboard status` prints why. Never report the board as
+complete coverage of Wellfound. swelist is deliberately omitted because its internship CLI reads
+an older Simplify repository that this board already consumes directly from current-cycle repos.
+
+Direct career-page monitors are learned from first-party links already observed on U.S. postings
+(location tiers 0-3). They query each employer's own ATS on future refreshes, so an aggregator only
+has to reveal a company once. International-only board sightings are not enrolled. All direct ATS
+feeds, including the larger Workday and SmartRecruiters sweep, run hourly.
 
 ## The Loop
 
@@ -45,7 +53,8 @@ python scripts/jobboard.py queue <key>      # appends to data/pipeline.md, marks
 ```
 
 `queue` writes a durable line with the board key, priority, URL, and ranking reasons. `autoqueue`
-does this for only the top-scoring new roles. From that point the existing workflow takes over.
+does this for only the top-scoring new roles. Scheduled runs stop there: they never invoke Codex or
+generate resumes. Evaluation and resume work requires the user's explicit request.
 
 ## Working A Job End To End
 
@@ -54,8 +63,8 @@ does this for only the top-scoring new roles. From that point the existing workf
    `jobboard describe --limit 5` and try again. **Never evaluate a role from its title alone.**
 3. Run `modes/evaluate.md` against the description in the brief. Save the JD to `jds/` with
    `python scripts/jobops.py fetch "<url>"` so the evaluation has a durable artifact.
-4. If the fit is worth a resume, run `modes/resume.md`. All of its rules still apply: exactly 15
-   grounded keyword phrases, evidence from `profile/master.md`, and
+4. If the fit is worth a resume, run `modes/resume.md`. All of its rules still apply: 6-12
+   grounded keyword phrases with gaps listed, evidence from `profile/master.md`, and
    `python scripts/jobops.py check-resume <file.tex>` must pass.
 5. Attach outputs with `jobboard artifacts <key> ...`; this makes report/resume buttons appear.
 6. Move the job to `READY_TO_APPLY` and add it to `data/applications.md` per `modes/tracker.md`.
