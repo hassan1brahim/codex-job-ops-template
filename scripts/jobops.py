@@ -126,6 +126,44 @@ def cmd_check_resume(args: argparse.Namespace) -> int:
     print("Keywords:")
     for index, keyword in enumerate(metrics.keywords, start=1):
         print(f"  {index:02d}. {keyword}")
+    if metrics.gaps:
+        print("Gaps (JD asks, no evidence):")
+        for gap in metrics.gaps:
+            print(f"  - {gap}")
+    return 0
+
+
+def cmd_match(args: argparse.Namespace) -> int:
+    from resume_match import MATCH_THRESHOLD, MIN_JD_SKILLS, rank_starters, resume_text, score_resume, skill_counts
+
+    jd_text = args.jd.read_text(encoding="utf-8")
+    if args.resume:
+        jd_counts = skill_counts(jd_text)
+        results = [score_resume(jd_counts, resume_text(args.resume), args.resume)]
+    else:
+        jd_counts, results = rank_starters(jd_text)
+    if not results:
+        print("No starter resumes found in profile/starter-resumes/.")
+        return 1
+
+    print(f"JD hard skills ({len(jd_counts)}): " + ", ".join(
+        f"{skill} x{count}" for skill, count in sorted(jd_counts.items(), key=lambda kv: -kv[1])))
+    from resume_match import title_hint
+
+    hint = title_hint(jd_text)
+    for result in results:
+        tag = "  (title match)" if result.resume.stem == hint else ""
+        print(f"  {result.score:6.1%}  {result.resume.name}{tag}")
+    best = results[0]
+    print(f"Best: {best.resume.name} at {best.score:.1%}")
+    if best.missing:
+        print("  Missing: " + ", ".join(best.missing))
+    if len(jd_counts) < MIN_JD_SKILLS:
+        print(f"VERDICT: TAILOR (only {len(jd_counts)} hard skills detected; too few to trust a match)")
+    elif best.score >= MATCH_THRESHOLD:
+        print(f"VERDICT: USE {best.resume.name} (>= {MATCH_THRESHOLD:.0%})")
+    else:
+        print(f"VERDICT: TAILOR (best match below {MATCH_THRESHOLD:.0%})")
     return 0
 
 
@@ -157,8 +195,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check_resume.add_argument("tex", type=Path)
     check_resume.add_argument("--output-pdf", type=Path)
-    check_resume.add_argument("--min-fill", type=float, default=0.88)
+    check_resume.add_argument("--min-fill", type=float, default=0.95)
     check_resume.set_defaults(func=cmd_check_resume)
+
+    match = sub.add_parser(
+        "match",
+        help="Score starter resumes against a JD by weighted hard-skill coverage.",
+    )
+    match.add_argument("jd", type=Path, help="Saved job description (jds/*.md).")
+    match.add_argument("--resume", type=Path, help="Score one resume instead of all starters.")
+    match.set_defaults(func=cmd_match)
 
     return parser
 
