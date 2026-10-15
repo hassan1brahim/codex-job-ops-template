@@ -1,0 +1,68 @@
+{
+  "manifest_version": 3,
+  "name": "Job Ops Workday Assistant",
+  "version": "0.1.0",
+  "description": "Review-first autofill for Workday applications. Never submits an application.",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "debugger"
+  ],
+  "host_permissions": [
+    "https://*.myworkdayjobs.com/*",
+    "https://careers.ibm.com/*",
+    "https://jobs.ashbyhq.com/*",
+    "https://boards.greenhouse.io/*",
+    "https://job-boards.greenhouse.io/*",
+    "https://jobs.lever.co/*",
+    "http://127.0.0.1:8766/*"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src http://127.0.0.1:8766"
+  },
+  "action": {
+    "default_title": "Workday Assistant",
+    "default_popup": "popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://*.myworkdayjobs.com/*"
+      ],
+      "js": [
+        "defaults.js",
+        "content.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://careers.ibm.com/*"
+      ],
+      "js": [
+        "standing-answers.js",
+        "engine.js",
+        "sites/ibm.js"
+      ],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": [
+        "https://jobs.ashbyhq.com/*",
+        "https://boards.greenhouse.io/*",
+        "https://job-boards.greenhouse.io/*",
+        "https://jobs.lever.co/*"
+      ],
+      "js": [
+        "standing-answers.js",
+        "engine.js",
+        "sites/generic.js"
+      ],
+      "run_at": "document_idle"
+    }
+  ]
+}

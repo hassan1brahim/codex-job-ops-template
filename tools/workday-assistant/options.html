@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Workday Assistant Profile</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body class="options">
+    <main>
+      <header>
+        <h1>Workday Assistant profile</h1>
+        <p>Stored only in Chrome on this Mac. Blank fields are never guessed.</p>
+      </header>
+
+      <form id="profile-form">
+        <fieldset>
+          <legend>Contact</legend>
+          <label>First name<input name="firstName" autocomplete="given-name"></label>
+          <label>Last name<input name="lastName" autocomplete="family-name"></label>
+          <label>Email<input name="email" type="email" autocomplete="email"></label>
+          <label>Phone<input name="phone" autocomplete="tel"></label>
+          <label>Phone country code<input name="phoneCountryCode" placeholder="United States of America (+1)"></label>
+          <label>Address line 1<input name="address1" autocomplete="address-line1"></label>
+          <label>Address line 2<input name="address2" autocomplete="address-line2"></label>
+          <label>City<input name="city" autocomplete="address-level2"></label>
+          <label>State<input name="state" autocomplete="address-level1"></label>
+          <label>Postal code<input name="postalCode" autocomplete="postal-code"></label>
+          <label>Country<input name="country" autocomplete="country-name"></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Links and application defaults</legend>
+          <label>LinkedIn<input name="linkedin" type="url"></label>
+          <label>GitHub<input name="github" type="url"></label>
+          <label>Website<input name="website" type="url"></label>
+          <label>Résumé path<input name="resumePath" placeholder="/Users/you/Downloads/resumes/Company_Role.pdf"></label>
+          <label>Authorized to work in the U.S.<select name="workAuthorizedUS"><option>Yes</option><option>No</option><option value="">Ask me</option></select></label>
+          <label>Require current or future sponsorship<select name="sponsorshipRequired"><option>No</option><option>Yes</option><option value="">Ask me</option></select></label>
+        </fieldset>
+
+        <fieldset>
+          <legend>Current education</legend>
+          <label>School<input name="education.school"></label>
+          <label>Degree<input name="education.degree"></label>
+          <label>Field of study<input name="education.field"></label>
+          <label>Start month<input name="education.startMonth"></label>
+          <label>Start year<input name="education.startYear"></label>
+          <label>Graduation month<input name="education.graduationMonth"></label>
+          <label>Graduation year<input name="education.graduationYear"></label>
+        </fieldset>
+
+        <div class="form-actions">
+          <button type="submit" class="primary">Save profile</button>
+          <button id="reset" type="button" class="secondary">Reset known defaults</button>
+          <span id="saved" role="status"></span>
+        </div>
+      </form>
+    </main>
+    <script src="defaults.js"></script>
+    <script src="options.js"></script>
+  </body>
+</html>

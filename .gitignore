@@ -12,6 +12,10 @@ config/board.json
 cv.md
 profile/master.md
 profile/resume-variants.md
+profile/application-defaults.json
+profile/application-defaults.md
+profile/starter-resumes/
+config/companies.json
 data/applications.md
 data/pipeline.md
 data/reminders.md

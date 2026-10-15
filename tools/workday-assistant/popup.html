@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Workday Assistant</title>
+    <link rel="stylesheet" href="styles.css">
+  </head>
+  <body class="popup">
+    <header>
+      <div class="eyebrow">JOB OPS</div>
+      <h1>Application Copilot</h1>
+      <p>One-click profile, résumé, and grounded AI autofill. You review and submit.</p>
+    </header>
+
+    <div id="status" class="status">Ready.</div>
+
+    <section class="job-card" aria-labelledby="job-heading">
+      <div class="job-card-top"><span class="ready-dot"></span><span>Workday detected</span></div>
+      <h2 id="job-heading">Current application</h2>
+      <div id="job-context" class="muted">Reading this page…</div>
+      <div class="asset-row"><span>Résumé</span><strong>SWE Backend</strong></div>
+      <div class="asset-row"><span>Profile</span><strong>Ready</strong></div>
+    </section>
+
+    <button id="autofill-all" type="button" class="primary hero-button full-width">✦ Autofill application</button>
+
+    <ol class="flow-steps">
+      <li><span>1</span> Fill verified profile data</li>
+      <li><span>2</span> Use AI for remaining supported questions</li>
+      <li><span>3</span> Review unresolved fields before continuing</li>
+    </ol>
+    <p class="guardrail">Never advances or submits. You control every application step.</p>
+
+    <details class="advanced">
+      <summary>Advanced controls</summary>
+      <div class="actions">
+        <button id="scan" type="button" class="secondary">Scan</button>
+        <button id="fill" type="button" class="secondary">Profile only</button>
+      </div>
+      <button id="ai-fill" type="button" class="secondary full-width">AI only</button>
+    </details>
+
+    <section aria-labelledby="summary-heading">
+      <h2 id="summary-heading">Review checkpoint</h2>
+      <div id="summary" class="summary muted">Autofill or scan the current step.</div>
+      <ul id="review-list" class="review-list"></ul>
+    </section>
+
+    <footer>
+      <button id="copy-review" type="button" class="link-button">Copy review list</button>
+      <button id="settings" type="button" class="link-button">Profile settings</button>
+    </footer>
+
+    <script src="defaults.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>
