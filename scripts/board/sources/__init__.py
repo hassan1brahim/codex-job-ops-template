@@ -22,18 +22,18 @@ class SourceResult:
     successful_boards: set[tuple[str, str]] = field(default_factory=set)
 
 
-from . import ats, linkedin, simplify, vansh, blocked  # noqa: E402
+from . import ats, linkedin, simplify, vansh, blocked, yc  # noqa: E402
 
 REGISTRY = {
     "simplify": simplify.fetch,
     "vansh": vansh.fetch,
     "linkedin": linkedin.fetch,
     "ats": ats.fetch,
+    "career_pages": ats.fetch_career_pages,
     "wellfound": blocked.wellfound,
-    "swelist": blocked.swelist,
-    "yc": blocked.yc,
+    "yc": yc.fetch,
 }
 
-DEFAULT_SOURCES = ["ats", "simplify", "vansh", "linkedin"]
+DEFAULT_SOURCES = ["ats", "career_pages", "simplify", "vansh", "linkedin", "yc"]
 
 __all__ = ["SourceResult", "REGISTRY", "DEFAULT_SOURCES", "Job"]
