@@ -1,11 +1,12 @@
 """LinkedIn via the public guest job-search endpoint.
 
-The guest endpoint serves job cards as HTML without a login. It is rate limited
-and will start returning 429 under load, so this source is deliberately slow and
-capped: it is a supplement to the GitHub feeds, not the backbone.
+The guest endpoint serves job cards as HTML without a login, 10 per page. It
+rate limits with 429s, so requests are spaced out and a 429 backs off and retries.
 
-`f_E=1` restricts to internship experience level, which is what keeps full-time
-roles out of the board.
+Two modes. `fast` (hourly) sweeps broad intern/internship/co-op searches posted in
+the last 24 hours, newest first. `deep` (daily) adds role-specific searches over the
+last week WITHOUT LinkedIn's internship filter, because many internships are filed as
+"Entry level"; `keep_job` then admits only titles that are real internships.
 """
 
 from __future__ import annotations
@@ -30,7 +31,37 @@ JOB = "https://www.linkedin.com/jobs-guest/jobs/api/jobPosting/{job_id}"
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
 
 # Searched in order; earlier geographies matter more, matching board ranking.
-DEFAULT_QUERIES = [tuple(query) for query in board_config()["linkedin_queries"]]
+GEOS = list(board_config()["linkedin_geos"])
+BROAD_KEYWORDS = ["intern", "internship", "co-op"]
+ROLE_KEYWORDS = [
+    "software engineer intern", "software engineering internship", "software developer intern",
+    "backend engineer intern", "frontend engineer intern", "full stack intern",
+    "machine learning intern", "AI engineer intern", "data science intern",
+    "data engineer intern", "cloud engineer intern", "cybersecurity intern",
+    "quantitative developer intern", "software engineer co-op", "summer 2027 intern",
+]
+PAGE_SIZE = 10
+
+
+@dataclass(frozen=True)
+class Query:
+    keywords: str
+    location: str
+    internship_filter: bool  # LinkedIn's f_E=1 experience-level facet
+    posted_within: str       # f_TPR, e.g. r86400 = last 24h
+
+
+def plan(mode: str) -> list[Query]:
+    """Searches for one run. Broad internship-filtered sweeps always run; deep adds role terms."""
+    window = "r86400" if mode == "fast" else "r604800"
+    queries = [Query(k, g, True, window) for g in GEOS for k in BROAD_KEYWORDS]
+    if mode == "deep":
+        queries += [Query(k, g, False, window) for g in GEOS for k in ROLE_KEYWORDS]
+    return queries
+
+
+# Kept for callers that pass explicit (keywords, location) pairs.
+DEFAULT_QUERIES = [(q.keywords, q.location) for q in plan("fast")]
 
 CARD_RE = re.compile(r'<li>\s*<div class="base-card[^"]*"(.*?)</li>', re.S)
 URN_RE = re.compile(r'data-entity-urn="urn:li:jobPosting:(\d+)"')
@@ -53,6 +84,18 @@ class LinkedInDetail:
 
 def _clean(raw: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", " ", raw or "")).strip()
+
+
+def _get_with_backoff(url: str, waits: tuple[int, ...] = (20, 60)) -> str | None:
+    """GET that waits out a 429 before giving up; raises RuntimeError if still limited."""
+    for wait in (*waits, None):
+        try:
+            return _get(url)
+        except RuntimeError:
+            if wait is None:
+                raise
+            time.sleep(wait)
+    return None
 
 
 def _get(url: str, timeout: int = 25) -> str | None:
@@ -159,43 +202,50 @@ def fetch_description(job_url: str) -> str | None:
 def fetch(cfg) -> "object":
     from . import SourceResult
 
-    queries = getattr(cfg, "linkedin_queries", None) or DEFAULT_QUERIES
-    pages = max(1, int(getattr(cfg, "linkedin_pages", 2)))
+    mode = getattr(cfg, "linkedin_mode", "deep")
+    max_pages = max(1, int(getattr(cfg, "linkedin_pages", 0) or (10 if mode == "fast" else 5)))
+    explicit = getattr(cfg, "linkedin_queries", None)
+    queries = ([Query(k, loc, True, "r604800") for k, loc in explicit] if explicit else plan(mode))
     seen: dict[str, Job] = {}
-    fetched = 0
+    fetched = requests = 0
     rate_limited = False
 
-    for keywords, location in queries:
-        for page in range(pages):
-            params = urllib.parse.urlencode(
-                {
-                    "keywords": keywords,
-                    "location": location,
-                    "f_E": "1",          # internship experience level
-                    "f_TPR": "r2592000",  # posted in the last 30 days
-                    "start": page * 25,
-                }
-            )
+    for query in queries:
+        start = 0
+        for _ in range(max_pages):
+            params = {
+                "keywords": query.keywords,
+                "location": query.location,
+                "f_TPR": query.posted_within,
+                "sortBy": "DD",  # newest first, so hourly runs see new posts on page 1
+                "start": start,
+            }
+            if query.internship_filter:
+                params["f_E"] = "1"
+            requests += 1
             try:
-                body = _get(f"{SEARCH}?{params}")
+                body = _get_with_backoff(f"{SEARCH}?{urllib.parse.urlencode(params)}")
             except RuntimeError:
                 rate_limited = True
                 body = None
             if not body:
                 break
             cards = _parse_cards(body)
-            fetched += len(cards)
             if not cards:
                 break
+            fetched += len(cards)
             for job in cards:
                 if keep_job(job, cfg):
                     seen.setdefault(job.key, job)
-            # Be a polite guest; this endpoint throttles aggressively.
+            # The guest API returns 10 cards a page; stepping by 25 skipped 60% of results.
+            start += len(cards)
             time.sleep(random.uniform(1.5, 3.0))
+            if len(cards) < PAGE_SIZE:
+                break
         if rate_limited:
             break
 
-    note = f"{len(queries)} queries x {pages}p"
+    note = f"{mode}: {len(queries)} queries, {requests} requests"
     if rate_limited:
         note += "; stopped early (429)"
     ok = bool(seen) or not rate_limited
